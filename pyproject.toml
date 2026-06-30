@@ -1,0 +1,46 @@
+[build-system]
+requires = ["scikit-build-core"]
+build-backend = "scikit_build_core.build"
+
+[project]
+name = "WarpCrypto"
+version = "1.2.5"
+description = "Fast and Portable Cryptography Extension Library"
+readme = "README.md"
+requires-python = ">=3.9"
+authors = [{ name = "Riajul" }]
+license = "LGPL-3.0-or-later"
+license-files = ["COPYING", "COPYING.lesser"]
+classifiers = [
+    "Development Status :: 5 - Production/Stable",
+    "Intended Audience :: Developers",
+    "Operating System :: OS Independent",
+    "Programming Language :: C",
+    "Programming Language :: Python",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Programming Language :: Python :: Implementation :: CPython",
+    "Topic :: Security",
+    "Topic :: Security :: Cryptography",
+    "Topic :: Internet",
+    "Topic :: Communications",
+    "Topic :: Software Development :: Libraries",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+]
+keywords = [
+    "crypto", "cryptography", "encryption", "mtproto",
+    "extension", "library", "aes", "warpcrypto",
+]
+
+[project.urls]
+Homepage = "https://github.com/rjriajul/WarpCrypto"
+Source = "https://github.com/rjriajul/WarpCrypto"
+Tracker = "https://github.com/rjriajul/WarpCrypto/issues"
+
+[tool.scikit-build]
+cmake.version = ">=3.15"
