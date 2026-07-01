@@ -210,7 +210,7 @@ fn kdf(auth_key: &[u8], msg_key: &[u8], outgoing: bool) -> PyResult<(Vec<u8>, Ve
 }
 
 #[pyfunction]
-fn pack_message(data: &[u8], salt: u64, session_id: &[u8], auth_key: &[u8], auth_key_id: &[u8]) -> PyResult<Vec<u8>> {
+fn pack_message(data: &[u8], salt: i64, session_id: &[u8], auth_key: &[u8], auth_key_id: &[u8]) -> PyResult<Vec<u8>> {
     let data_len = data.len();
     let len_data = data_len + 16;
     let total_plain = (len_data + 12 + 15) & !15;

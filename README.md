@@ -13,7 +13,7 @@ It implements the cryptographic algorithms required by Telegram's MTProto protoc
 ## Features
 
 - **3–5× faster** than tgcrypto (C extension) in multi-client benchmarks
-- **AES-NI hardware acceleration** via `-C target-cpu=native` (automatic runtime detection)
+- **AES-NI hardware acceleration** via the `aes` crate's runtime CPU feature detection (`cpufeatures`)
 - **Zero-copy** IGE with block-aligned GenericArray operations
 - **Block-based CTR** — processes 16-byte blocks with `chunks_exact_mut`, not byte-by-byte
 - **Proper state propagation** — IV and state bytearrays are mutated in-place matching tgcrypto exactly
@@ -109,13 +109,7 @@ pytest
 ## Performance
 
 WarpCrypto outperforms tgcrypto (C extension) by **3–5×** across all client counts (1–128 concurrent clients).
-
-| Clients | tgcrypto (ops/s) | WarpCrypto (ops/s) | Speedup |
-|---------|-----------------|-------------------|--------|
-| 1       | 82,018          | 306,232           | 3.73×  |
-| 16      | 128,655         | 371,855           | 2.89×  |
-| 64      | 121,142         | 406,384           | 3.35×  |
-| 128     | 94,975          | 501,293           | 5.28×  |
+Performance scales with AES-NI availability (most x86_64 and Apple Silicon CPUs).
 
 ## License
 

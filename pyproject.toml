@@ -43,3 +43,9 @@ Homepage = "https://github.com/rjriajul/WarpCrypto"
 Source = "https://github.com/rjriajul/WarpCrypto"
 Tracker = "https://github.com/rjriajul/WarpCrypto/issues"
 
+[tool.maturin]
+features = ["pyo3/extension-module"]
+# Build universal2 on macOS for ARM+Intel single wheel
+universal2 = true
+strip = true
+
