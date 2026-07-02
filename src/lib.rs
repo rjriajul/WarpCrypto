@@ -295,8 +295,22 @@ fn unpack_message(py: Python<'_>, packed: &[u8], session_id: &[u8], auth_key: &[
         ige256_decrypt_slice(&mut dec, &cipher, &aes_iv);
 
         if dec.len() < 16 {
-            return Err(PyValueError::new_err("decrypted data too short"));
+            return Err(PyValueError::new_err("msg_key mismatch"));
         }
+
+        // https://core.telegram.org/mtproto/security_guidelines#checking-sha256-hash-value-of-msg-key
+        // msg_key must equal SHA256(auth_key[88:120] + plaintext)[8:24]
+        let msg_key_check = {
+            let mut h = Sha256::new();
+            h.update(&auth_key[MSG_KEY_AUTH_LO..MSG_KEY_AUTH_HI]);
+            h.update(&dec);
+            h.finalize()
+        };
+        if &msg_key_check[8..24] != msg_key {
+            return Err(PyValueError::new_err("msg_key mismatch"));
+        }
+
+        // https://core.telegram.org/mtproto/security_guidelines#checking-session-id
         if &dec[8..16] != &session_id[..] {
             return Err(PyValueError::new_err("session_id mismatch"));
         }
