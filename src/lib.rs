@@ -145,27 +145,38 @@ fn ctr_process(data: &mut [u8], cipher: &Aes256, ctr: &mut [u8; 16], state: &mut
 }
 
 #[pyfunction]
-fn ige256_encrypt(data: &[u8], key: &[u8], iv: &[u8]) -> PyResult<Vec<u8>> {
+fn ige256_encrypt(py: Python<'_>, data: &[u8], key: &[u8], iv: &[u8]) -> PyResult<Vec<u8>> {
     if key.len() != 32 { return Err(PyValueError::new_err("Key must be 32 bytes")); }
     if iv.len() != 32 { return Err(PyValueError::new_err("IV must be 32 bytes")); }
-    let cipher = Aes256::new_from_slice(key).unwrap();
-    let mut buf = data.to_vec();
-    ige256_encrypt_slice(&mut buf, &cipher, iv);
-    Ok(buf)
+    let data = data.to_vec();
+    let key = key.to_vec();
+    let iv = iv.to_vec();
+    Ok(py.detach(move || {
+        let cipher = Aes256::new_from_slice(&key).unwrap();
+        let mut buf = data;
+        ige256_encrypt_slice(&mut buf, &cipher, &iv);
+        buf
+    }))
 }
 
 #[pyfunction]
-fn ige256_decrypt(data: &[u8], key: &[u8], iv: &[u8]) -> PyResult<Vec<u8>> {
+fn ige256_decrypt(py: Python<'_>, data: &[u8], key: &[u8], iv: &[u8]) -> PyResult<Vec<u8>> {
     if key.len() != 32 { return Err(PyValueError::new_err("Key must be 32 bytes")); }
     if iv.len() != 32 { return Err(PyValueError::new_err("IV must be 32 bytes")); }
-    let cipher = Aes256::new_from_slice(key).unwrap();
-    let mut buf = data.to_vec();
-    ige256_decrypt_slice(&mut buf, &cipher, iv);
-    Ok(buf)
+    let data = data.to_vec();
+    let key = key.to_vec();
+    let iv = iv.to_vec();
+    Ok(py.detach(move || {
+        let cipher = Aes256::new_from_slice(&key).unwrap();
+        let mut buf = data;
+        ige256_decrypt_slice(&mut buf, &cipher, &iv);
+        buf
+    }))
 }
 
 #[pyfunction]
 fn ctr256_encrypt(
+    py: Python<'_>,
     data: &[u8],
     key: &[u8],
     iv: &Bound<'_, PyByteArray>,
@@ -174,32 +185,38 @@ fn ctr256_encrypt(
     if key.len() != 32 { return Err(PyValueError::new_err("Key must be 32 bytes")); }
     if iv.len() != 16 { return Err(PyValueError::new_err("IV must be 16 bytes")); }
 
+    let data = data.to_vec();
+    let key = key.to_vec();
     let mut ctr = [0u8; 16];
-    unsafe { ctr.copy_from_slice(iv.as_bytes()); }
-
-    let mut state_off = unsafe { state.as_bytes()[0] as usize };
+    unsafe {
+        ctr.copy_from_slice(iv.as_bytes());
+    }
+    let mut state_off = unsafe { state.as_bytes()[0] } as usize;
     if state_off >= 16 { state_off = 0; }
 
-    let cipher = Aes256::new_from_slice(key).unwrap();
-    let mut buf = data.to_vec();
-    ctr_process(&mut buf, &cipher, &mut ctr, &mut state_off);
+    let (buf, ctr_out, state_out) = py.detach(move || {
+        let cipher = Aes256::new_from_slice(&key).unwrap();
+        let mut buf = data;
+        ctr_process(&mut buf, &cipher, &mut ctr, &mut state_off);
+        (buf, ctr, state_off)
+    });
 
     unsafe {
-        iv.as_bytes_mut().copy_from_slice(&ctr);
-        state.as_bytes_mut()[0] = state_off as u8;
+        iv.as_bytes_mut().copy_from_slice(&ctr_out);
+        state.as_bytes_mut()[0] = state_out as u8;
     }
-
     Ok(buf)
 }
 
 #[pyfunction]
 fn ctr256_decrypt(
+    py: Python<'_>,
     data: &[u8],
     key: &[u8],
     iv: &Bound<'_, PyByteArray>,
     state: &Bound<'_, PyByteArray>,
 ) -> PyResult<Vec<u8>> {
-    ctr256_encrypt(data, key, iv, state)
+    ctr256_encrypt(py, data, key, iv, state)
 }
 
 #[pyfunction]
@@ -210,63 +227,77 @@ fn kdf(auth_key: &[u8], msg_key: &[u8], outgoing: bool) -> PyResult<(Vec<u8>, Ve
 }
 
 #[pyfunction]
-fn pack_message(data: &[u8], salt: i64, session_id: &[u8], auth_key: &[u8], auth_key_id: &[u8]) -> PyResult<Vec<u8>> {
-    let data_len = data.len();
-    let len_data = data_len + 16;
-    let total_plain = (len_data + 12 + 15) & !15;
-    let total_out = 24 + total_plain;
-    let mut out = vec![0u8; total_out];
-    let plain = &mut out[24..];
+fn pack_message(py: Python<'_>, data: &[u8], salt: i64, session_id: &[u8], auth_key: &[u8], auth_key_id: &[u8]) -> PyResult<Vec<u8>> {
+    let data = data.to_vec();
+    let session_id = session_id.to_vec();
+    let auth_key = auth_key.to_vec();
+    let auth_key_id = auth_key_id.to_vec();
 
-    let (salt_slice, rest) = plain.split_at_mut(8);
-    salt_slice.copy_from_slice(&salt.to_le_bytes());
-    let (sid, rest) = rest.split_at_mut(8);
-    sid.copy_from_slice(session_id);
-    let (data_slice, padding) = rest.split_at_mut(data_len);
-    data_slice.copy_from_slice(data);
-    let _ = getrandom::getrandom(padding);
+    Ok(py.detach(move || {
+        let data_len = data.len();
+        let len_data = data_len + 16;
+        let total_plain = (len_data + 12 + 15) & !15;
+        let total_out = 24 + total_plain;
+        let mut out = vec![0u8; total_out];
+        let plain = &mut out[24..];
 
-    let msg_key_large = {
-        let mut h = Sha256::new();
-        h.update(&auth_key[MSG_KEY_AUTH_LO..MSG_KEY_AUTH_HI]);
-        h.update(&plain[..total_plain]);
-        h.finalize()
-    };
-    let msg_key = &msg_key_large[8..24];
+        let (salt_slice, rest) = plain.split_at_mut(8);
+        salt_slice.copy_from_slice(&(salt as u64).to_le_bytes());
+        let (sid, rest) = rest.split_at_mut(8);
+        sid.copy_from_slice(&session_id);
+        let (data_slice, padding) = rest.split_at_mut(data_len);
+        data_slice.copy_from_slice(&data);
+        let _ = getrandom::getrandom(padding);
 
-    let (aes_key, aes_iv) = kdf_inner(auth_key, msg_key, 0);
-    let cipher = Aes256::new_from_slice(&aes_key).unwrap();
-    ige256_encrypt_slice(&mut out[24..], &cipher, &aes_iv);
+        let msg_key_large = {
+            let mut h = Sha256::new();
+            h.update(&auth_key[MSG_KEY_AUTH_LO..MSG_KEY_AUTH_HI]);
+            h.update(&plain[..total_plain]);
+            h.finalize()
+        };
+        let msg_key = &msg_key_large[8..24];
 
-    out[..8].copy_from_slice(auth_key_id);
-    out[8..24].copy_from_slice(msg_key);
-    Ok(out)
+        let (aes_key, aes_iv) = kdf_inner(&auth_key, msg_key, 0);
+        let cipher = Aes256::new_from_slice(&aes_key).unwrap();
+        ige256_encrypt_slice(&mut out[24..], &cipher, &aes_iv);
+
+        out[..8].copy_from_slice(&auth_key_id);
+        out[8..24].copy_from_slice(msg_key);
+        out
+    }))
 }
 
 #[pyfunction]
-fn unpack_message(packed: &[u8], session_id: &[u8], auth_key: &[u8], auth_key_id: &[u8]) -> PyResult<Vec<u8>> {
+fn unpack_message(py: Python<'_>, packed: &[u8], session_id: &[u8], auth_key: &[u8], auth_key_id: &[u8]) -> PyResult<Vec<u8>> {
     if packed.len() < 24 {
         return Err(PyValueError::new_err("packed data too short"));
     }
     if &packed[..8] != auth_key_id {
         return Err(PyValueError::new_err("auth_key_id mismatch"));
     }
-    let msg_key = &packed[8..24];
-    let encrypted = &packed[24..];
+    let packed = packed.to_vec();
+    let session_id = session_id.to_vec();
+    let auth_key = auth_key.to_vec();
+    let _auth_key_id = auth_key_id.to_vec();
 
-    let (aes_key, aes_iv) = kdf_inner(auth_key, msg_key, 8);
-    let cipher = Aes256::new_from_slice(&aes_key).unwrap();
-    let mut dec = encrypted.to_vec();
-    ige256_decrypt_slice(&mut dec, &cipher, &aes_iv);
+    py.detach(move || {
+        let msg_key = &packed[8..24];
+        let encrypted = &packed[24..];
 
-    if dec.len() < 16 {
-        return Err(PyValueError::new_err("decrypted data too short"));
-    }
-    if &dec[8..16] != session_id {
-        return Err(PyValueError::new_err("session_id mismatch"));
-    }
-    dec.drain(..16);
-    Ok(dec)
+        let (aes_key, aes_iv) = kdf_inner(&auth_key, msg_key, 8);
+        let cipher = Aes256::new_from_slice(&aes_key).unwrap();
+        let mut dec = encrypted.to_vec();
+        ige256_decrypt_slice(&mut dec, &cipher, &aes_iv);
+
+        if dec.len() < 16 {
+            return Err(PyValueError::new_err("decrypted data too short"));
+        }
+        if &dec[8..16] != &session_id[..] {
+            return Err(PyValueError::new_err("session_id mismatch"));
+        }
+        dec.drain(..16);
+        Ok(dec)
+    })
 }
 
 #[pymodule]
