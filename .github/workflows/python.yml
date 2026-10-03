@@ -35,8 +35,6 @@ jobs:
       - name: Run tests
         run: pip install pytest && pytest
 
-      # A module that does not declare free-threading support switches the GIL
-      # back on at import, which would make the 3.14t wheel a lie.
       - name: GIL stays disabled
         if: matrix.python-version == '3.14t'
         run: python -W error -c "import sys, warpcrypto; assert not sys._is_gil_enabled()"

@@ -10,8 +10,6 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # Linux wheels are built in the manylinux/musllinux containers, which
-          # carry every CPython (3.14t included) and PyPy, and tag for glibc 2.17.
           - { os: ubuntu-latest, target: x86_64, manylinux: auto }
           - { os: ubuntu-24.04-arm, target: aarch64, manylinux: auto }
           - { os: ubuntu-latest, target: x86_64, manylinux: musllinux_1_2 }
@@ -25,8 +23,6 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
-      # Linux finds its interpreters inside the container; macOS and Windows
-      # build for whatever is installed here.
       - uses: actions/setup-python@v6
         if: runner.os != 'Linux'
         with:
@@ -59,7 +55,6 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
-      # Anything without a wheel (GraalPy, a future interpreter) builds from this.
       - name: Build sdist
         uses: PyO3/maturin-action@v1
         with:
