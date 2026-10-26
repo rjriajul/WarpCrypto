@@ -566,7 +566,7 @@ fn unpack_message<'py>(py: Python<'py>, packed: &[u8], session_id: &[u8], auth_k
         }
 
         // https://core.telegram.org/mtproto/security_guidelines#checking-session-id
-        if &dec[8..16] != &session_id[..] {
+        if dec[8..16] != session_id[..] {
             return Err(PyValueError::new_err("session_id mismatch"));
         }
         let msg_id = i64::from_le_bytes(dec[16..24].try_into().unwrap());
@@ -578,6 +578,13 @@ fn unpack_message<'py>(py: Python<'py>, packed: &[u8], session_id: &[u8], auth_k
         let length = length_i32 as usize;
         if 32 + length > dec.len() {
             return Err(PyValueError::new_err("body length exceeds decrypted data"));
+        }
+        // https://core.telegram.org/mtproto/security_guidelines#checking-message-length
+        if length % 4 != 0 {
+            return Err(PyValueError::new_err("body length not divisible by 4"));
+        }
+        if !(12..=1024).contains(&(dec.len() - 32 - length)) {
+            return Err(PyValueError::new_err("padding length out of range"));
         }
         let total_len = dec[16..].len() as i32;
         Ok((msg_id, seq_no, length, total_len, dec))

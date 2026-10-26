@@ -168,7 +168,7 @@ class TestUnpackMessage(unittest.TestCase):
         return warpcrypto.pack_message(msg_id, seq_no, body, self.SALT, self.SESSION_ID, self.AUTH_KEY, self.AUTH_KEY_ID)
 
     def test_unpack_roundtrip(self):
-        payload = os.urandom(50)
+        payload = os.urandom(52)
         packed = self.pack(payload, msg_id=42, seq_no=7)
         # outgoing=False because pack uses x=0 (client→server), so unpack must also use x=0
         msg_id, seq_no, length, body, total_len = warpcrypto.unpack_message(
@@ -176,7 +176,7 @@ class TestUnpackMessage(unittest.TestCase):
         )
         self.assertEqual(msg_id, 42)
         self.assertEqual(seq_no, 7)
-        self.assertEqual(length, 50)
+        self.assertEqual(length, 52)
         self.assertEqual(body, payload)
         self.assertGreater(total_len, 0)
 
@@ -222,6 +222,44 @@ class TestUnpackMessage(unittest.TestCase):
         packed[10] ^= 0x01
         with self.assertRaises(ValueError):
             warpcrypto.unpack_message(bytes(packed), self.SESSION_ID, self.AUTH_KEY, self.AUTH_KEY_ID)
+
+    def server_packet(self, body: bytes, pad: int, declared_len=None):
+        # Build a server→client message by hand (x=8) with a valid msg_key, so only the length checks can reject it
+        import hashlib, struct
+        plain = struct.pack("<q8sqii", self.SALT, self.SESSION_ID, 99, 3,
+                            len(body) if declared_len is None else declared_len) + body + os.urandom(pad)
+        assert len(plain) % 16 == 0
+        msg_key = hashlib.sha256(self.AUTH_KEY[96:128] + plain).digest()[8:24]
+        key, iv = warpcrypto.kdf(self.AUTH_KEY, msg_key, False)
+        return self.AUTH_KEY_ID + msg_key + warpcrypto.ige256_encrypt(plain, key, iv)
+
+    def unpack_server(self, packet):
+        return warpcrypto.unpack_message(packet, self.SESSION_ID, self.AUTH_KEY, self.AUTH_KEY_ID)
+
+    def test_unpack_server_message(self):
+        for body, pad in [(b"abcd", 12), (b"", 1024), (os.urandom(100), 12), (os.urandom(1000), 24)]:
+            msg_id, seq_no, length, out, _ = self.unpack_server(self.server_packet(body, pad))
+            self.assertEqual((msg_id, seq_no, length, out), (99, 3, len(body), body))
+
+    def test_unpack_padding_too_short(self):
+        for body, pad in [(b"abcdefgh", 8), (os.urandom(16), 0), (os.urandom(12), 4)]:
+            with self.assertRaisesRegex(ValueError, "padding length out of range"):
+                self.unpack_server(self.server_packet(body, pad))
+
+    def test_unpack_padding_too_long(self):
+        for pad in [1040, 2048]:
+            with self.assertRaisesRegex(ValueError, "padding length out of range"):
+                self.unpack_server(self.server_packet(b"", pad))
+
+    def test_unpack_padding_hidden_by_declared_length(self):
+        # 16 real body bytes + 16 padding, but the header claims 28 bytes of body, leaving 4 bytes of padding
+        with self.assertRaisesRegex(ValueError, "padding length out of range"):
+            self.unpack_server(self.server_packet(os.urandom(16), 16, declared_len=28))
+
+    def test_unpack_length_not_divisible_by_4(self):
+        for body, pad in [(b"ab", 14), (b"abcde", 27)]:
+            with self.assertRaisesRegex(ValueError, "not divisible by 4"):
+                self.unpack_server(self.server_packet(body, pad))
 
 
 if __name__ == "__main__":
