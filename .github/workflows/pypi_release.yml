@@ -66,6 +66,25 @@ jobs:
           name: sdist
           path: dist/*.tar.gz
 
+  # Uses crates.io trusted publishing; the very first release has to be published by hand
+  crates:
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: rust-lang/crates-io-auth-action@v1
+        id: auth
+
+      - name: Publish to crates.io
+        run: cargo publish
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
+
   publish:
     runs-on: ubuntu-latest
     needs: [wheels, sdist]

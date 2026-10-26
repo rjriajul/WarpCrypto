@@ -44,3 +44,31 @@ jobs:
         with:
           name: wheels-${{ matrix.os }}-${{ matrix.python-version }}
           path: dist/*.whl
+
+  rust:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [ubuntu-latest, ubuntu-24.04-arm, macos-latest, windows-latest]
+        # 1.85 is the rust-version in Cargo.toml
+        toolchain: ["1.85", stable]
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ matrix.toolchain }}
+          components: clippy
+
+      - name: Test
+        run: cargo test --release
+
+      - name: Clippy
+        if: matrix.toolchain == 'stable'
+        run: cargo clippy --release --all-targets -- -D warnings
+
+      - name: Package
+        if: matrix.toolchain == 'stable' && matrix.os == 'ubuntu-latest'
+        run: cargo publish --dry-run

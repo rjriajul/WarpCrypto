@@ -1,16 +1,9 @@
 WarpCrypto - Fast and Portable Cryptography Extension Library
-Forked from TgCrypto / Pyrogram
-Original Copyright (C) 2017-present Dan <https://github.com/delivrance>
+https://github.com/rjriajul/WarpCrypto
+Copyright (C) 2026-present Riajul <https://github.com/rjriajul> and WarpCrypto contributors
+Originally based on TgCrypto by Dan <https://github.com/delivrance>
 
-This library is free software: you can redistribute it and/or modify
-it under the terms of the GNU Lesser General Public License as published
-by the Free Software Foundation, either version 3 of the License, or
-(at your option) any later version.
+Licensed under the Apache License, Version 2.0 (see LICENSE).
 
-This library is distributed in the hope that it will be useful,
-but WITHOUT ANY WARRANTY; without even the implied warranty of
-MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-GNU Lesser General Public License for more details.
-
-You should have received a copy of the GNU Lesser General Public License
-along with this library.  If not, see <http://www.gnu.org/licenses/>.
+Under section 4 of that license, every fork, copy or modified version
+must keep this NOTICE file with the credit above.

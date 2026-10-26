@@ -1,37 +1,14 @@
+//! Fast AES-256-IGE, AES-256-CTR and MTProto 2.0 message packing for Telegram clients.
+//!
+//! The same code also builds the `warpcrypto` Python extension (behind the `python` feature).
+
 use aes::cipher::{BlockBackend, BlockClosure, BlockDecrypt, BlockEncrypt, BlockSizeUser, KeyInit, ParBlocks};
 use aes::cipher::typenum::Unsigned;
 use aes::cipher::inout::InOut;
 use aes::Aes256;
 use aes::cipher::generic_array::GenericArray;
 use aes::cipher::typenum::U16;
-use pyo3::exceptions::PyValueError;
-use pyo3::prelude::*;
-use pyo3::types::{PyByteArray, PyBytes};
 use sha2::{Digest, Sha256};
-
-thread_local! {
-    static SCRATCH: std::cell::RefCell<Vec<u8>> =
-        const { std::cell::RefCell::new(Vec::new()) };
-}
-
-const SCRATCH_KEEP: usize = 2 * 1024 * 1024;
-
-const GIL_RELEASE_MIN: usize = 2048;
-
-#[inline(always)]
-fn maybe_detach<T: Send>(py: Python<'_>, len: usize, f: impl FnOnce() -> T + Send) -> T {
-    if len >= GIL_RELEASE_MIN { py.detach(f) } else { f() }
-}
-
-fn scratch_take() -> Vec<u8> {
-    SCRATCH.with(|s| std::mem::take(&mut *s.borrow_mut()))
-}
-
-fn scratch_put(buf: Vec<u8>) {
-    if buf.capacity() <= SCRATCH_KEEP {
-        SCRATCH.with(|s| *s.borrow_mut() = buf);
-    }
-}
 
 type AesBlock = GenericArray<u8, U16>;
 
@@ -227,386 +204,214 @@ fn ctr_process(data: &mut [u8], cipher: &Aes256, ctr: &mut [u8; 16], state: &mut
     cipher.encrypt_with_backend(CtrProcess { data, ctr, state });
 }
 
-#[pyfunction]
-fn ige256_encrypt<'py>(py: Python<'py>, data: &[u8], key: &[u8], iv: &[u8]) -> PyResult<Bound<'py, PyBytes>> {
-    if key.len() != 32 { return Err(PyValueError::new_err("Key must be 32 bytes")); }
-    if iv.len() != 32 { return Err(PyValueError::new_err("IV must be 32 bytes")); }
-    let mut buf = scratch_take();
-    buf.clear();
-    buf.extend_from_slice(data);
-    let key: [u8; 32] = key.try_into().unwrap();
-    let iv: [u8; 32] = iv.try_into().unwrap();
-    let buf = maybe_detach(py, buf.len(), move || {
-        let cipher = Aes256::new_from_slice(&key).unwrap();
-        let mut buf = buf;
-        ige256_encrypt_slice(&mut buf, &cipher, &iv);
-        buf
-    });
-    let out = PyBytes::new(py, &buf);
-    scratch_put(buf);
-    Ok(out)
-}
-
-#[pyfunction]
-fn ige256_decrypt<'py>(py: Python<'py>, data: &[u8], key: &[u8], iv: &[u8]) -> PyResult<Bound<'py, PyBytes>> {
-    if key.len() != 32 { return Err(PyValueError::new_err("Key must be 32 bytes")); }
-    if iv.len() != 32 { return Err(PyValueError::new_err("IV must be 32 bytes")); }
-    let mut buf = scratch_take();
-    buf.clear();
-    buf.extend_from_slice(data);
-    let key: [u8; 32] = key.try_into().unwrap();
-    let iv: [u8; 32] = iv.try_into().unwrap();
-    let buf = maybe_detach(py, buf.len(), move || {
-        let cipher = Aes256::new_from_slice(&key).unwrap();
-        let mut buf = buf;
-        ige256_decrypt_slice(&mut buf, &cipher, &iv);
-        buf
-    });
-    let out = PyBytes::new(py, &buf);
-    scratch_put(buf);
-    Ok(out)
-}
-
-#[pyfunction]
-fn ctr256_encrypt<'py>(
-    py: Python<'py>,
-    src: &[u8],
-    key: &[u8],
-    iv: &Bound<'_, PyByteArray>,
-    state: &Bound<'_, PyByteArray>,
-) -> PyResult<Bound<'py, PyBytes>> {
-    if key.len() != 32 { return Err(PyValueError::new_err("Key must be 32 bytes")); }
-    if iv.len() != 16 { return Err(PyValueError::new_err("IV must be 16 bytes")); }
-
-    let mut data = scratch_take();
-    data.clear();
-    data.extend_from_slice(src);
-    let key: [u8; 32] = key.try_into().unwrap();
-    let mut ctr = [0u8; 16];
-    unsafe {
-        ctr.copy_from_slice(iv.as_bytes());
-    }
-    let mut state_off = unsafe { state.as_bytes()[0] } as usize;
-    if state_off >= 16 { state_off = 0; }
-
-    let (buf, ctr_out, state_out) = maybe_detach(py, data.len(), move || {
-        let cipher = Aes256::new_from_slice(&key).unwrap();
-        let mut buf = data;
-        ctr_process(&mut buf, &cipher, &mut ctr, &mut state_off);
-        (buf, ctr, state_off)
-    });
-
-    unsafe {
-        iv.as_bytes_mut().copy_from_slice(&ctr_out);
-        state.as_bytes_mut()[0] = state_out as u8;
-    }
-    let out = PyBytes::new(py, &buf);
-    scratch_put(buf);
-    Ok(out)
-}
-
-#[pyfunction]
-fn ctr256_decrypt<'py>(
-    py: Python<'py>,
-    src: &[u8],
-    key: &[u8],
-    iv: &Bound<'_, PyByteArray>,
-    state: &Bound<'_, PyByteArray>,
-) -> PyResult<Bound<'py, PyBytes>> {
-    ctr256_encrypt(py, src, key, iv, state)
-}
-
-/// In-place CTR encrypt: copies data out, processes, writes back.
-/// Saves one allocation vs the returning version.
-#[pyfunction]
-fn ctr256_encrypt_inplace(
-    py: Python<'_>,
-    data: &Bound<'_, PyByteArray>,
-    key: &[u8],
-    iv: &Bound<'_, PyByteArray>,
-    state: &Bound<'_, PyByteArray>,
-) -> PyResult<()> {
-    if key.len() != 32 { return Err(PyValueError::new_err("Key must be 32 bytes")); }
-    if iv.len() != 16 { return Err(PyValueError::new_err("IV must be 16 bytes")); }
-
-    let mut buf = unsafe { data.as_bytes() }.to_vec();
-    let key: [u8; 32] = key.try_into().unwrap();
-    let mut ctr = [0u8; 16];
-    unsafe { ctr.copy_from_slice(iv.as_bytes()); }
-    let mut state_off = unsafe { state.as_bytes()[0] } as usize;
-    if state_off >= 16 { state_off = 0; }
-
-    let (buf, ctr_out, state_out) = maybe_detach(py, buf.len(), move || {
-        let cipher = Aes256::new_from_slice(&key).unwrap();
-        ctr_process(&mut buf, &cipher, &mut ctr, &mut state_off);
-        (buf, ctr, state_off)
-    });
-
-    unsafe {
-        data.as_bytes_mut().copy_from_slice(&buf);
-        iv.as_bytes_mut().copy_from_slice(&ctr_out);
-        state.as_bytes_mut()[0] = state_out as u8;
-    }
-    Ok(())
-}
-
-#[pyfunction]
-fn ctr256_decrypt_inplace(
-    py: Python<'_>,
-    data: &Bound<'_, PyByteArray>,
-    key: &[u8],
-    iv: &Bound<'_, PyByteArray>,
-    state: &Bound<'_, PyByteArray>,
-) -> PyResult<()> {
-    ctr256_encrypt_inplace(py, data, key, iv, state)
-}
-
-/// Batch CTR encrypt: all data passed as a single flat buffer with sizes list.
-/// Eliminates per-item Python list indexing (O(1) Python calls regardless of batch size).
-#[pyfunction]
-fn ctr256_encrypt_batch(
-    _py: Python<'_>,
-    data_flat: &[u8],
-    sizes: &Bound<'_, PyByteArray>,
-    key: &[u8],
-    ivs: &Bound<'_, PyByteArray>,
-    states: &Bound<'_, PyByteArray>,
-) -> PyResult<Vec<u8>> {
-    if key.len() != 32 { return Err(PyValueError::new_err("Key must be 32 bytes")); }
-    let n = states.len();
-    if n == 0 { return Ok(Vec::new()); }
-    if ivs.len() != n * 16 { return Err(PyValueError::new_err("ivs must be 16*n bytes")); }
-    if sizes.len() != n * 4 { return Err(PyValueError::new_err("sizes must be 4*n bytes")); }
-
-    let mut offsets: Vec<usize> = Vec::with_capacity(n + 1);
-    offsets.push(0);
-    let mut total = 0usize;
-    unsafe {
-        let sz_bytes = sizes.as_bytes();
-        for i in 0..n {
-            let sz = u32::from_le_bytes([
-                sz_bytes[i * 4],
-                sz_bytes[i * 4 + 1],
-                sz_bytes[i * 4 + 2],
-                sz_bytes[i * 4 + 3],
-            ]) as usize;
-            total = total.checked_add(sz).ok_or_else(|| PyValueError::new_err("total data size overflow"))?;
-            offsets.push(total);
-        }
-    }
-    if total > data_flat.len() {
-        return Err(PyValueError::new_err("data_flat too short for given sizes"));
-    }
-
-    let key_vec = key.to_vec();
-    let mut data_owned = data_flat.to_vec();
-
-    let mut ctrs: Vec<[u8; 16]> = Vec::with_capacity(n);
-    let mut state_offs: Vec<usize> = Vec::with_capacity(n);
-    unsafe {
-        let iv_bytes = ivs.as_bytes();
-        let st_bytes = states.as_bytes();
-        for i in 0..n {
-            let mut ctr = [0u8; 16];
-            ctr.copy_from_slice(&iv_bytes[i * 16..][..16]);
-            ctrs.push(ctr);
-            let mut s = st_bytes[i] as usize;
-            if s >= 16 { s = 0; }
-            state_offs.push(s);
-        }
-    }
-
-    let results = _py.detach(move || {
-        let cipher = Aes256::new_from_slice(&key_vec).unwrap();
-        for i in 0..n {
-            let slice = &mut data_owned[offsets[i]..offsets[i + 1]];
-            ctr_process(slice, &cipher, &mut ctrs[i], &mut state_offs[i]);
-        }
-        (data_owned, ctrs, state_offs)
-    });
-
-    let (data_out, ctrs_out, state_offs_out) = results;
-    unsafe {
-        for i in 0..n {
-            ivs.as_bytes_mut()[i * 16..][..16].copy_from_slice(&ctrs_out[i]);
-            states.as_bytes_mut()[i] = state_offs_out[i] as u8;
-        }
-    }
-    Ok(data_out)
-}
-
-#[pyfunction]
-fn ctr256_decrypt_batch(
-    py: Python<'_>,
-    data_flat: &[u8],
-    sizes: &Bound<'_, PyByteArray>,
-    key: &[u8],
-    ivs: &Bound<'_, PyByteArray>,
-    states: &Bound<'_, PyByteArray>,
-) -> PyResult<Vec<u8>> {
-    ctr256_encrypt_batch(py, data_flat, sizes, key, ivs, states)
-}
-
-#[pyfunction]
-fn kdf(auth_key: &[u8], msg_key: &[u8], outgoing: bool) -> PyResult<(Vec<u8>, Vec<u8>)> {
-    if auth_key.len() != 256 { return Err(PyValueError::new_err("auth_key must be 256 bytes")); }
-    let x: usize = if outgoing { 0 } else { 8 };
-    let (key_arr, iv_arr) = kdf_inner(auth_key, msg_key, x);
-    Ok((key_arr.to_vec(), iv_arr.to_vec()))
-}
-
-#[pyfunction]
-fn pack_message<'py>(py: Python<'py>, msg_id: i64, seq_no: i32, body: &[u8], salt: i64, session_id: &[u8], auth_key: &[u8], auth_key_id: &[u8]) -> PyResult<Bound<'py, PyBytes>> {
-    if auth_key.len() != 256 { return Err(PyValueError::new_err("auth_key must be 256 bytes")); }
-    if auth_key_id.len() != 8 { return Err(PyValueError::new_err("auth_key_id must be 8 bytes")); }
-    if session_id.len() != 8 { return Err(PyValueError::new_err("session_id must be 8 bytes")); }
-    let body_len = body.len();
+fn packed_len(body_len: usize) -> usize {
     let inner_len = 8 + 8 + 8 + 4 + 4 + body_len;
-    let total_plain = (inner_len + 12 + 15) & !15;
-    let total_out = 24 + total_plain;
-
-    let mut out = scratch_take();
-    out.clear();
-    out.resize(total_out, 0);
-    {
-        let plain = &mut out[24..];
-        let (salt_slice, rest) = plain.split_at_mut(8);
-        salt_slice.copy_from_slice(&(salt as u64).to_le_bytes());
-        let (sid, rest) = rest.split_at_mut(8);
-        sid.copy_from_slice(session_id);
-        let (mid, rest) = rest.split_at_mut(8);
-        mid.copy_from_slice(&(msg_id as u64).to_le_bytes());
-        let (sn, rest) = rest.split_at_mut(4);
-        sn.copy_from_slice(&(seq_no as u32).to_le_bytes());
-        let (lenb, rest) = rest.split_at_mut(4);
-        lenb.copy_from_slice(&(body_len as u32).to_le_bytes());
-        let (data_slice, padding) = rest.split_at_mut(body_len);
-        data_slice.copy_from_slice(body);
-        let _ = getrandom::getrandom(padding);
-    }
-
-    let auth_key: [u8; 256] = auth_key.try_into().unwrap();
-    let auth_key_id: [u8; 8] = auth_key_id.try_into().unwrap();
-
-    let out = maybe_detach(py, total_out, move || {
-        let mut out = out;
-
-        // https://core.telegram.org/mtproto/description
-        // msg_key = SHA256(auth_key[88+x:88+x+32] + plaintext)[8:24]
-        // x=0 for outgoing (client→server), so auth_key[88:120]
-        let msg_key_large = {
-            let mut h = Sha256::new();
-            h.update(&auth_key[MSG_KEY_AUTH_LO..MSG_KEY_AUTH_HI]);
-            h.update(&out[24..24 + total_plain]);
-            h.finalize()
-        };
-        let msg_key: [u8; 16] = msg_key_large[8..24].try_into().unwrap();
-
-        let (aes_key, aes_iv) = kdf_inner(&auth_key, &msg_key, 0);
-        let cipher = Aes256::new_from_slice(&aes_key).unwrap();
-        ige256_encrypt_slice(&mut out[24..], &cipher, &aes_iv);
-
-        out[..8].copy_from_slice(&auth_key_id);
-        out[8..24].copy_from_slice(&msg_key);
-        out
-    });
-
-    let packed = PyBytes::new(py, &out);
-    scratch_put(out);
-    Ok(packed)
+    24 + ((inner_len + 12 + 15) & !15)
 }
 
-#[pyfunction]
-#[pyo3(signature = (packed, session_id, auth_key, auth_key_id, incoming=true))]
-fn unpack_message<'py>(py: Python<'py>, packed: &[u8], session_id: &[u8], auth_key: &[u8], auth_key_id: &[u8], incoming: bool) -> PyResult<(i64, i32, i32, Bound<'py, PyBytes>, i32)> {
-    if auth_key.len() != 256 { return Err(PyValueError::new_err("auth_key must be 256 bytes")); }
-    if auth_key_id.len() != 8 { return Err(PyValueError::new_err("auth_key_id must be 8 bytes")); }
+/// Writes salt, session_id, msg_id, seq_no, length, body and random padding after the 24-byte outer header.
+fn pack_plain(out: &mut [u8], msg_id: i64, seq_no: i32, body: &[u8], salt: i64, session_id: &[u8]) {
+    let plain = &mut out[24..];
+    let (salt_slice, rest) = plain.split_at_mut(8);
+    salt_slice.copy_from_slice(&(salt as u64).to_le_bytes());
+    let (sid, rest) = rest.split_at_mut(8);
+    sid.copy_from_slice(session_id);
+    let (mid, rest) = rest.split_at_mut(8);
+    mid.copy_from_slice(&(msg_id as u64).to_le_bytes());
+    let (sn, rest) = rest.split_at_mut(4);
+    sn.copy_from_slice(&(seq_no as u32).to_le_bytes());
+    let (lenb, rest) = rest.split_at_mut(4);
+    lenb.copy_from_slice(&(body.len() as u32).to_le_bytes());
+    let (data_slice, padding) = rest.split_at_mut(body.len());
+    data_slice.copy_from_slice(body);
+    let _ = getrandom::getrandom(padding);
+}
+
+/// Encrypts the plaintext written by `pack_plain` in place and fills in auth_key_id and msg_key.
+fn pack_seal(out: &mut [u8], auth_key: &[u8; 256], auth_key_id: &[u8; 8]) {
+    // https://core.telegram.org/mtproto/description
+    // msg_key = SHA256(auth_key[88+x:88+x+32] + plaintext)[8:24]
+    // x=0 for outgoing (client→server), so auth_key[88:120]
+    let msg_key_large = {
+        let mut h = Sha256::new();
+        h.update(&auth_key[MSG_KEY_AUTH_LO..MSG_KEY_AUTH_HI]);
+        h.update(&out[24..]);
+        h.finalize()
+    };
+    let msg_key: [u8; 16] = msg_key_large[8..24].try_into().unwrap();
+
+    let (aes_key, aes_iv) = kdf_inner(auth_key, &msg_key, 0);
+    let cipher = Aes256::new_from_slice(&aes_key).unwrap();
+    ige256_encrypt_slice(&mut out[24..], &cipher, &aes_iv);
+
+    out[..8].copy_from_slice(auth_key_id);
+    out[8..24].copy_from_slice(&msg_key);
+}
+
+/// Checks the outer header and returns the msg_key.
+fn unpack_header(packed: &[u8], auth_key_id: &[u8]) -> Result<[u8; 16], Error> {
     if packed.len() < 24 {
-        return Err(PyValueError::new_err("packed data too short"));
+        return Err(Error::TooShort);
     }
-    if &packed[..8] != auth_key_id {
-        return Err(PyValueError::new_err("auth_key_id mismatch"));
+    if packed[..8] != *auth_key_id {
+        return Err(Error::AuthKeyIdMismatch);
     }
-    let msg_key: [u8; 16] = packed[8..24].try_into().unwrap();
-    let mut dec = scratch_take();
-    dec.clear();
-    dec.extend_from_slice(&packed[24..]);
-    let session_id = session_id.to_vec();
-    let auth_key: [u8; 256] = auth_key.try_into().unwrap();
-    let x: usize = if incoming { 8 } else { 0 };
-
-    let (msg_id, seq_no, length, total_len, dec) = maybe_detach(py, dec.len(),
-        move || -> PyResult<(i64, i32, usize, i32, Vec<u8>)> {
-        let (aes_key, aes_iv) = kdf_inner(&auth_key, &msg_key, x);
-        let cipher = Aes256::new_from_slice(&aes_key).unwrap();
-        ige256_decrypt_slice(&mut dec, &cipher, &aes_iv);
-
-        if dec.len() < 32 {
-            return Err(PyValueError::new_err("msg_key mismatch"));
-        }
-
-        // https://core.telegram.org/mtproto/description
-        // msg_key = SHA256(auth_key[88+x:88+x+32] + plaintext + padding)[8:24]
-        // where x=0 for client->server (outgoing), x=8 for server->client (incoming)
-        // https://core.telegram.org/mtproto/security_guidelines#checking-sha256-hash-value-of-msg-key
-        // Note: the security guidelines page incorrectly omits the x offset (always shows 88:120)
-        let (msg_key_lo, msg_key_hi) = if incoming {
-            (96usize, 128usize)
-        } else {
-            (88usize, 120usize)
-        };
-        let msg_key_check = {
-            let mut h = Sha256::new();
-            h.update(&auth_key[msg_key_lo..msg_key_hi]);
-            h.update(&dec);
-            h.finalize()
-        };
-        if msg_key_check[8..24] != msg_key {
-            return Err(PyValueError::new_err("msg_key mismatch"));
-        }
-
-        // https://core.telegram.org/mtproto/security_guidelines#checking-session-id
-        if dec[8..16] != session_id[..] {
-            return Err(PyValueError::new_err("session_id mismatch"));
-        }
-        let msg_id = i64::from_le_bytes(dec[16..24].try_into().unwrap());
-        let seq_no = i32::from_le_bytes(dec[24..28].try_into().unwrap());
-        let length_i32 = i32::from_le_bytes(dec[28..32].try_into().unwrap());
-        if length_i32 < 0 {
-            return Err(PyValueError::new_err("negative body length"));
-        }
-        let length = length_i32 as usize;
-        if 32 + length > dec.len() {
-            return Err(PyValueError::new_err("body length exceeds decrypted data"));
-        }
-        // https://core.telegram.org/mtproto/security_guidelines#checking-message-length
-        if length % 4 != 0 {
-            return Err(PyValueError::new_err("body length not divisible by 4"));
-        }
-        if !(12..=1024).contains(&(dec.len() - 32 - length)) {
-            return Err(PyValueError::new_err("padding length out of range"));
-        }
-        let total_len = dec[16..].len() as i32;
-        Ok((msg_id, seq_no, length, total_len, dec))
-    })?;
-
-    let body = PyBytes::new(py, &dec[32..32 + length]);
-    scratch_put(dec);
-    Ok((msg_id, seq_no, length as i32, body, total_len))
+    Ok(packed[8..24].try_into().unwrap())
 }
 
-#[pymodule]
-fn warpcrypto(m: &Bound<'_, PyModule>) -> PyResult<()> {
-    m.add_function(wrap_pyfunction!(ige256_encrypt, m)?)?;
-    m.add_function(wrap_pyfunction!(ige256_decrypt, m)?)?;
-    m.add_function(wrap_pyfunction!(ctr256_encrypt, m)?)?;
-    m.add_function(wrap_pyfunction!(ctr256_decrypt, m)?)?;
-    m.add_function(wrap_pyfunction!(ctr256_encrypt_inplace, m)?)?;
-    m.add_function(wrap_pyfunction!(ctr256_decrypt_inplace, m)?)?;
-    m.add_function(wrap_pyfunction!(ctr256_encrypt_batch, m)?)?;
-    m.add_function(wrap_pyfunction!(ctr256_decrypt_batch, m)?)?;
-    m.add_function(wrap_pyfunction!(kdf, m)?)?;
-    m.add_function(wrap_pyfunction!(pack_message, m)?)?;
-    m.add_function(wrap_pyfunction!(unpack_message, m)?)?;
+/// Decrypts `dec` (everything after the outer header) in place and runs the MTProto checks.
+/// Returns msg_id, seq_no and the body length; the body is `dec[32..32 + length]`.
+fn unpack_open(dec: &mut [u8], msg_key: &[u8; 16], auth_key: &[u8; 256], session_id: &[u8], incoming: bool) -> Result<(i64, i32, usize), Error> {
+    let x: usize = if incoming { 8 } else { 0 };
+    let (aes_key, aes_iv) = kdf_inner(auth_key, msg_key, x);
+    let cipher = Aes256::new_from_slice(&aes_key).unwrap();
+    ige256_decrypt_slice(dec, &cipher, &aes_iv);
+
+    if dec.len() < 32 {
+        return Err(Error::MsgKeyMismatch);
+    }
+
+    // https://core.telegram.org/mtproto/description
+    // msg_key = SHA256(auth_key[88+x:88+x+32] + plaintext + padding)[8:24]
+    // where x=0 for client->server (outgoing), x=8 for server->client (incoming)
+    // https://core.telegram.org/mtproto/security_guidelines#checking-sha256-hash-value-of-msg-key
+    // Note: the security guidelines page incorrectly omits the x offset (always shows 88:120)
+    let (msg_key_lo, msg_key_hi) = if incoming {
+        (96usize, 128usize)
+    } else {
+        (88usize, 120usize)
+    };
+    let msg_key_check = {
+        let mut h = Sha256::new();
+        h.update(&auth_key[msg_key_lo..msg_key_hi]);
+        h.update(&*dec);
+        h.finalize()
+    };
+    if msg_key_check[8..24] != *msg_key {
+        return Err(Error::MsgKeyMismatch);
+    }
+
+    // https://core.telegram.org/mtproto/security_guidelines#checking-session-id
+    if dec[8..16] != *session_id {
+        return Err(Error::SessionIdMismatch);
+    }
+    let msg_id = i64::from_le_bytes(dec[16..24].try_into().unwrap());
+    let seq_no = i32::from_le_bytes(dec[24..28].try_into().unwrap());
+    let length_i32 = i32::from_le_bytes(dec[28..32].try_into().unwrap());
+    if length_i32 < 0 {
+        return Err(Error::NegativeLength);
+    }
+    let length = length_i32 as usize;
+    if 32 + length > dec.len() {
+        return Err(Error::LengthExceedsData);
+    }
+    // https://core.telegram.org/mtproto/security_guidelines#checking-message-length
+    if length % 4 != 0 {
+        return Err(Error::LengthNotAligned);
+    }
+    if !(12..=1024).contains(&(dec.len() - 32 - length)) {
+        return Err(Error::PaddingOutOfRange);
+    }
+    Ok((msg_id, seq_no, length))
+}
+
+/// Why an operation was rejected.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum Error {
+    /// IGE input length is not a multiple of 16 bytes.
+    NotBlockAligned,
+    /// Packed message is shorter than its 24-byte outer header.
+    TooShort,
+    AuthKeyIdMismatch,
+    /// The message was tampered with, corrupted, or encrypted with another key.
+    MsgKeyMismatch,
+    SessionIdMismatch,
+    NegativeLength,
+    LengthExceedsData,
+    LengthNotAligned,
+    PaddingOutOfRange,
+}
+
+impl std::fmt::Display for Error {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Error::NotBlockAligned => "data length must be a multiple of 16 bytes",
+            Error::TooShort => "packed data too short",
+            Error::AuthKeyIdMismatch => "auth_key_id mismatch",
+            Error::MsgKeyMismatch => "msg_key mismatch",
+            Error::SessionIdMismatch => "session_id mismatch",
+            Error::NegativeLength => "negative body length",
+            Error::LengthExceedsData => "body length exceeds decrypted data",
+            Error::LengthNotAligned => "body length not divisible by 4",
+            Error::PaddingOutOfRange => "padding length out of range",
+        })
+    }
+}
+
+impl std::error::Error for Error {}
+
+/// AES-256-IGE encrypts `data` in place. `data.len()` must be a multiple of 16.
+pub fn ige256_encrypt(data: &mut [u8], key: &[u8; 32], iv: &[u8; 32]) -> Result<(), Error> {
+    if data.len() % 16 != 0 {
+        return Err(Error::NotBlockAligned);
+    }
+    ige256_encrypt_slice(data, &Aes256::new_from_slice(key).unwrap(), iv);
     Ok(())
 }
+
+/// AES-256-IGE decrypts `data` in place. `data.len()` must be a multiple of 16.
+pub fn ige256_decrypt(data: &mut [u8], key: &[u8; 32], iv: &[u8; 32]) -> Result<(), Error> {
+    if data.len() % 16 != 0 {
+        return Err(Error::NotBlockAligned);
+    }
+    ige256_decrypt_slice(data, &Aes256::new_from_slice(key).unwrap(), iv);
+    Ok(())
+}
+
+/// AES-256-CTR encrypts or decrypts `data` in place.
+///
+/// `iv` (the counter) and `state` (bytes already used from the current keystream block)
+/// are updated, so a stream can be processed across several calls. Start `state` at 0;
+/// a value of 16 or more is treated as 0.
+pub fn ctr256(data: &mut [u8], key: &[u8; 32], iv: &mut [u8; 16], state: &mut u8) {
+    let mut off = if *state < 16 { *state as usize } else { 0 };
+    ctr_process(data, &Aes256::new_from_slice(key).unwrap(), iv, &mut off);
+    *state = off as u8;
+}
+
+/// MTProto 2.0 key derivation: returns `(aes_key, aes_iv)` for a message.
+/// `outgoing` is true for client→server messages (x=0) and false for server→client (x=8).
+pub fn kdf(auth_key: &[u8; 256], msg_key: &[u8; 16], outgoing: bool) -> ([u8; 32], [u8; 32]) {
+    kdf_inner(auth_key, msg_key, if outgoing { 0 } else { 8 })
+}
+
+/// Encrypts a client→server MTProto 2.0 message, ready to send.
+pub fn pack_message(auth_key: &[u8; 256], auth_key_id: &[u8; 8], session_id: &[u8; 8], salt: i64, msg_id: i64, seq_no: i32, body: &[u8]) -> Vec<u8> {
+    let mut out = vec![0u8; packed_len(body.len())];
+    pack_plain(&mut out, msg_id, seq_no, body, salt, session_id);
+    pack_seal(&mut out, auth_key, auth_key_id);
+    out
+}
+
+/// A decrypted MTProto message.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Message {
+    pub msg_id: i64,
+    pub seq_no: i32,
+    pub body: Vec<u8>,
+}
+
+/// Decrypts and checks an MTProto 2.0 message.
+/// `incoming` is true for server→client messages, the usual case for a client.
+pub fn unpack_message(packed: &[u8], auth_key: &[u8; 256], auth_key_id: &[u8; 8], session_id: &[u8; 8], incoming: bool) -> Result<Message, Error> {
+    let msg_key = unpack_header(packed, auth_key_id)?;
+    let mut dec = packed[24..].to_vec();
+    let (msg_id, seq_no, length) = unpack_open(&mut dec, &msg_key, auth_key, session_id, incoming)?;
+    dec.truncate(32 + length);
+    dec.drain(..32);
+    Ok(Message { msg_id, seq_no, body: dec })
+}
+
+#[cfg(feature = "python")]
+mod python;

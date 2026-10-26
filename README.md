@@ -10,6 +10,24 @@ It implements the cryptographic algorithms required by Telegram's MTProto protoc
 - **`kdf`** — key derivation function per MTProto 2.0 spec
 - **`pack_message` / `unpack_message`** — combined KDF+AES-IGE in a single call (1 GIL release vs 3 for tgcrypto)
 
+It is also a plain Rust crate, without Python:
+
+```toml
+[dependencies]
+warpcrypto = "2"
+```
+
+```rust
+let packed = warpcrypto::pack_message(&auth_key, &auth_key_id, &session_id, salt, msg_id, seq_no, &body);
+let msg = warpcrypto::unpack_message(&reply, &auth_key, &auth_key_id, &session_id, true)?;
+
+warpcrypto::ige256_encrypt(&mut data, &key, &iv)?;        // data.len() must be a multiple of 16
+warpcrypto::ctr256(&mut data, &key, &mut iv, &mut state); // encrypt and decrypt are the same
+let (aes_key, aes_iv) = warpcrypto::kdf(&auth_key, &msg_key, true);
+```
+
+On ARM (Apple Silicon, ARM servers), build with `RUSTFLAGS="--cfg aes_armv8"` to use the CPU's AES instructions; without it AES runs in software. The Python wheels already do this.
+
 ## Features
 
 - **3–5× faster** than tgcrypto (C extension) in multi-client benchmarks
@@ -113,4 +131,4 @@ Performance scales with AES-NI availability (most x86_64 and Apple Silicon CPUs)
 
 ## License
 
-[LGPLv3+](COPYING.lesser) — Originally by Dan. Rust port maintained by Riajul.
+[Apache-2.0](LICENSE). Forks and copies must keep the [NOTICE](NOTICE) file with credit to WarpCrypto and Riajul. Originally based on TgCrypto by Dan.
