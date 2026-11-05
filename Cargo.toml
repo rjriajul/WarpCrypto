@@ -24,7 +24,8 @@ sha2 = "0.10"
 getrandom = "0.2"
 
 [dependencies.aes]
-version = "0.8"
+# 0.9.3 raised the aes MSRV to 1.89; keep this cap until rust-version moves past it
+version = ">=0.9.2, <0.9.3"
 features = ["zeroize"]
 
 [profile.release]

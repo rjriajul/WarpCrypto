@@ -2,15 +2,16 @@
 //!
 //! The same code also builds the `warpcrypto` Python extension (behind the `python` feature).
 
-use aes::cipher::{BlockBackend, BlockClosure, BlockDecrypt, BlockEncrypt, BlockSizeUser, KeyInit, ParBlocks};
-use aes::cipher::typenum::Unsigned;
-use aes::cipher::inout::InOut;
 use aes::Aes256;
-use aes::cipher::generic_array::GenericArray;
 use aes::cipher::typenum::U16;
+use aes::cipher::typenum::Unsigned;
+use aes::cipher::{
+    Array, BlockCipherDecBackend, BlockCipherDecClosure, BlockCipherDecrypt, BlockCipherEncBackend,
+    BlockCipherEncClosure, BlockCipherEncrypt, BlockSizeUser, KeyInit, ParBlocks,
+};
 use sha2::{Digest, Sha256};
 
-type AesBlock = GenericArray<u8, U16>;
+type AesBlock = Array<u8, U16>;
 
 #[inline(always)]
 fn block_from_slice(s: &[u8]) -> AesBlock {
@@ -33,15 +34,15 @@ impl BlockSizeUser for IgeEncrypt<'_> {
     type BlockSize = U16;
 }
 
-impl BlockClosure for IgeEncrypt<'_> {
-    fn call<B: BlockBackend<BlockSize = U16>>(self, backend: &mut B) {
+impl BlockCipherEncClosure for IgeEncrypt<'_> {
+    fn call<B: BlockCipherEncBackend<BlockSize = U16>>(self, backend: &B) {
         let mut iv1 = word_at(self.iv, 0);
         let mut iv2 = word_at(self.iv, 16);
 
         for chunk in self.data.chunks_exact_mut(16) {
             let plain = u128::from_ne_bytes(chunk.try_into().unwrap());
             let mut block = AesBlock::from((plain ^ iv1).to_ne_bytes());
-            backend.proc_block(InOut::from(&mut block));
+            backend.encrypt_block_inplace(&mut block);
             let out = u128::from_ne_bytes(block.into()) ^ iv2;
             chunk.copy_from_slice(&out.to_ne_bytes());
             iv1 = out;
@@ -59,15 +60,15 @@ impl BlockSizeUser for IgeDecrypt<'_> {
     type BlockSize = U16;
 }
 
-impl BlockClosure for IgeDecrypt<'_> {
-    fn call<B: BlockBackend<BlockSize = U16>>(self, backend: &mut B) {
+impl BlockCipherDecClosure for IgeDecrypt<'_> {
+    fn call<B: BlockCipherDecBackend<BlockSize = U16>>(self, backend: &B) {
         let mut iv1 = word_at(self.iv, 16);
         let mut iv2 = word_at(self.iv, 0);
 
         for chunk in self.data.chunks_exact_mut(16) {
             let ct = u128::from_ne_bytes(chunk.try_into().unwrap());
             let mut block = AesBlock::from((ct ^ iv1).to_ne_bytes());
-            backend.proc_block(InOut::from(&mut block));
+            backend.decrypt_block_inplace(&mut block);
             let out = u128::from_ne_bytes(block.into()) ^ iv2;
             chunk.copy_from_slice(&out.to_ne_bytes());
             iv1 = out;
@@ -134,8 +135,8 @@ impl BlockSizeUser for CtrProcess<'_> {
     type BlockSize = U16;
 }
 
-impl BlockClosure for CtrProcess<'_> {
-    fn call<B: BlockBackend<BlockSize = U16>>(self, backend: &mut B) {
+impl BlockCipherEncClosure for CtrProcess<'_> {
+    fn call<B: BlockCipherEncBackend<BlockSize = U16>>(self, backend: &B) {
         let data = self.data;
         let ctr = self.ctr;
         let state = self.state;
@@ -147,7 +148,7 @@ impl BlockClosure for CtrProcess<'_> {
 
         if *state != 0 {
             let mut ks = block_from_slice(ctr);
-            backend.proc_block(InOut::from(&mut ks));
+            backend.encrypt_block_inplace(&mut ks);
             let take = (16 - *state).min(len);
             for i in 0..take {
                 data[pos + i] ^= ks[*state + i];
@@ -169,7 +170,7 @@ impl BlockClosure for CtrProcess<'_> {
                 *k = block_from_slice(ctr);
                 ctr_next(ctr);
             }
-            backend.proc_par_blocks(InOut::from(&mut ks));
+            backend.encrypt_par_blocks_inplace(&mut ks);
             for (i, k) in ks.iter().enumerate() {
                 let at = i * 16;
                 let x = u128::from_ne_bytes(group[at..at + 16].try_into().unwrap())
@@ -181,7 +182,7 @@ impl BlockClosure for CtrProcess<'_> {
         let mut chunks = wide.into_remainder().chunks_exact_mut(16);
         for chunk in &mut chunks {
             let mut ks = block_from_slice(ctr);
-            backend.proc_block(InOut::from(&mut ks));
+            backend.encrypt_block_inplace(&mut ks);
             let x = u128::from_ne_bytes(chunk.try_into().unwrap())
                 ^ u128::from_ne_bytes(ks.into());
             chunk.copy_from_slice(&x.to_ne_bytes());
@@ -191,7 +192,7 @@ impl BlockClosure for CtrProcess<'_> {
 
         if !tail.is_empty() {
             let mut ks = block_from_slice(ctr);
-            backend.proc_block(InOut::from(&mut ks));
+            backend.encrypt_block_inplace(&mut ks);
             for i in 0..tail.len() {
                 tail[i] ^= ks[i];
             }
