@@ -2,7 +2,7 @@
 //!
 //! The same code also builds the `warpcrypto` Python extension (behind the `python` feature).
 
-use aes::Aes256;
+use aes::{Aes256, Aes256Enc};
 use aes::cipher::typenum::U16;
 use aes::cipher::typenum::Unsigned;
 use aes::cipher::{
@@ -201,7 +201,7 @@ impl BlockCipherEncClosure for CtrProcess<'_> {
     }
 }
 
-fn ctr_process(data: &mut [u8], cipher: &Aes256, ctr: &mut [u8; 16], state: &mut usize) {
+fn ctr_process<C: BlockCipherEncrypt<BlockSize = U16>>(data: &mut [u8], cipher: &C, ctr: &mut [u8; 16], state: &mut usize) {
     cipher.encrypt_with_backend(CtrProcess { data, ctr, state });
 }
 
@@ -379,6 +379,59 @@ pub fn ctr256(data: &mut [u8], key: &[u8; 32], iv: &mut [u8; 16], state: &mut u8
     let mut off = if *state < 16 { *state as usize } else { 0 };
     ctr_process(data, &Aes256::new_from_slice(key).unwrap(), iv, &mut off);
     *state = off as u8;
+}
+
+/// AES-256-CTR with the key expanded once, for a stream processed piece by piece.
+///
+/// Gives the same output as [`ctr256`] called with the same key on each piece, without
+/// expanding the key again on every call.
+///
+/// ```
+/// let (key, iv) = ([7u8; 32], [9u8; 16]);
+/// let mut a = *b"split across calls";
+/// let mut b = a;
+///
+/// let mut ctr = warpcrypto::Ctr256::new(&key, &iv);
+/// ctr.apply_keystream(&mut a[..5]);
+/// ctr.apply_keystream(&mut a[5..]);
+///
+/// let (mut iv, mut state) = (iv, 0);
+/// warpcrypto::ctr256(&mut b, &key, &mut iv, &mut state);
+/// assert_eq!(a, b);
+/// assert_eq!((ctr.iv(), ctr.state()), (&iv, state));
+/// ```
+pub struct Ctr256 {
+    cipher: Aes256Enc,
+    iv: [u8; 16],
+    state: usize,
+}
+
+impl Ctr256 {
+    /// Starts a stream at counter `iv`.
+    pub fn new(key: &[u8; 32], iv: &[u8; 16]) -> Self {
+        Self { cipher: Aes256Enc::new(key.into()), iv: *iv, state: 0 }
+    }
+
+    /// Encrypts or decrypts `data` in place, continuing where the previous call stopped.
+    pub fn apply_keystream(&mut self, data: &mut [u8]) {
+        ctr_process(data, &self.cipher, &mut self.iv, &mut self.state);
+    }
+
+    /// The current counter, as [`ctr256`] would have left `iv`.
+    pub fn iv(&self) -> &[u8; 16] {
+        &self.iv
+    }
+
+    /// Bytes already used from the current keystream block, as [`ctr256`] would have left `state`.
+    pub fn state(&self) -> u8 {
+        self.state as u8
+    }
+}
+
+impl std::fmt::Debug for Ctr256 {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Ctr256").finish_non_exhaustive()
+    }
 }
 
 /// MTProto 2.0 key derivation: returns `(aes_key, aes_iv)` for a message.

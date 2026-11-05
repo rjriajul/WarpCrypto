@@ -77,6 +77,35 @@ fn ctr_bad_state_is_treated_as_zero() {
 }
 
 #[test]
+fn ctr_type_known_answer() {
+    let expected = hex("5a6f06540cfe7791f8275f360ecea89d70e202c6d7904e4a4d0fe14a6ef83ed03c4455781ee0ea8393c8218ec93ce9bda6fa");
+    let mut data = range::<50>(0);
+    let mut ctr = warpcrypto::Ctr256::new(&range::<32>(0), &range::<16>(0));
+    ctr.apply_keystream(&mut data);
+    assert_eq!(data.to_vec(), expected);
+    assert_eq!((u128::from_be_bytes(*ctr.iv()), ctr.state()), (u128::from_be_bytes(range::<16>(0)) + 3, 2));
+}
+
+#[test]
+fn ctr_type_matches_function_across_calls() {
+    let key = range::<32>(5);
+    let steps = [1, 15, 16, 17, 3, 0, 127, 128, 129, 5, 1000, 31, 2, 4096, 13, 64, 1, 255];
+    // the last two counters carry across bytes and wrap around
+    for start in [range::<16>(3), [0xff; 16], [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xfe]] {
+        let mut ctr = warpcrypto::Ctr256::new(&key, &start);
+        let (mut iv, mut state) = (start, 0);
+        for (n, step) in steps.into_iter().enumerate() {
+            let plain: Vec<u8> = (0..step).map(|i| (i * 7 + n) as u8).collect();
+            let (mut a, mut b) = (plain.clone(), plain);
+            ctr.apply_keystream(&mut a);
+            warpcrypto::ctr256(&mut b, &key, &mut iv, &mut state);
+            assert_eq!(a, b, "step {n}");
+            assert_eq!((ctr.iv(), ctr.state()), (&iv, state), "step {n}");
+        }
+    }
+}
+
+#[test]
 fn kdf_known_answer() {
     let (ak, mk) = (auth_key(), range::<16>(0));
     let (k, iv) = warpcrypto::kdf(&ak, &mk, true);

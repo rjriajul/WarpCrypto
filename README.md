@@ -23,6 +23,9 @@ let msg = warpcrypto::unpack_message(&reply, &auth_key, &auth_key_id, &session_i
 
 warpcrypto::ige256_encrypt(&mut data, &key, &iv)?;        // data.len() must be a multiple of 16
 warpcrypto::ctr256(&mut data, &key, &mut iv, &mut state); // encrypt and decrypt are the same
+
+let mut stream = warpcrypto::Ctr256::new(&key, &iv);       // same as ctr256, key expanded once
+stream.apply_keystream(&mut chunk);
 let (aes_key, aes_iv) = warpcrypto::kdf(&auth_key, &msg_key, true);
 ```
 
