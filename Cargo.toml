@@ -26,7 +26,8 @@ getrandom = "0.2"
 [dependencies.aes]
 # 0.9.3 raised the aes MSRV to 1.89; keep this cap until rust-version moves past it
 version = ">=0.9.2, <0.9.3"
-features = ["zeroize"]
+# no `zeroize` feature: it wipes the cipher a byte at a time on every drop; `Wiped` in lib.rs
+# wipes the same bytes a word at a time
 
 [profile.release]
 lto = "fat"

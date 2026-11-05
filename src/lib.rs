@@ -10,8 +10,60 @@ use aes::cipher::{
     BlockCipherEncClosure, BlockCipherEncrypt, BlockSizeUser, KeyInit, ParBlocks,
 };
 use sha2::{Digest, Sha256};
+use std::mem::ManuallyDrop;
+use std::ops::Deref;
+use std::sync::atomic::{Ordering, compiler_fence};
 
 type AesBlock = Array<u8, U16>;
+
+/// A cipher whose key schedule is overwritten with zeros when it is dropped.
+///
+/// `aes` is built without its `zeroize` feature: from 0.9 that feature wipes the whole cipher
+/// (about 1 KB, sized for the software fallback) one byte at a time on every drop, which costs
+/// more than encrypting a short message. This wipes the same bytes a machine word at a time.
+struct Wiped<C>(ManuallyDrop<C>);
+
+impl<C: KeyInit> Wiped<C> {
+    /// Panics unless `key` has the cipher's key length.
+    fn new(key: &[u8]) -> Self {
+        Self(ManuallyDrop::new(C::new_from_slice(key).unwrap()))
+    }
+}
+
+impl<C> Deref for Wiped<C> {
+    type Target = C;
+
+    fn deref(&self) -> &C {
+        &self.0
+    }
+}
+
+impl<C> Drop for Wiped<C> {
+    fn drop(&mut self) {
+        const { assert!(align_of::<C>() >= align_of::<usize>()) };
+        let words = size_of::<C>() / size_of::<usize>();
+        let tail = size_of::<C>() % size_of::<usize>();
+        let p = (&mut *self.0 as *mut C).cast::<usize>();
+        // SAFETY: `p` points to the `size_of::<C>()` bytes of `self.0` and is aligned for `usize`
+        // (asserted above); `words` words and then `tail` bytes cover exactly those bytes.
+        // `self.0` is never read or dropped after this, so the zeros need not be a valid `C`.
+        // Skipping `C`'s destructor is fine because it does nothing here: in aes 0.9.2 the `Drop`
+        // of `Aes256`/`Aes256Enc` (src/lib.rs:434-442) has the `zeroize` wipe as its only
+        // statement, compiled out since that feature is off, and the ciphers own no heap memory.
+        // `needs_drop::<C>()` is still true because the impl exists, so this can't be asserted;
+        // it relies on that body staying empty, which the `<0.9.3` cap in Cargo.toml pins.
+        unsafe {
+            for i in 0..words {
+                p.add(i).write_volatile(0);
+            }
+            let p = p.add(words).cast::<u8>();
+            for i in 0..tail {
+                p.add(i).write_volatile(0);
+            }
+        }
+        compiler_fence(Ordering::SeqCst);
+    }
+}
 
 #[inline(always)]
 fn block_from_slice(s: &[u8]) -> AesBlock {
@@ -77,11 +129,11 @@ impl BlockCipherDecClosure for IgeDecrypt<'_> {
     }
 }
 
-fn ige256_encrypt_slice(data: &mut [u8], cipher: &Aes256, iv: &[u8]) {
+fn ige256_encrypt_slice(data: &mut [u8], cipher: &Wiped<Aes256>, iv: &[u8]) {
     cipher.encrypt_with_backend(IgeEncrypt { data, iv });
 }
 
-fn ige256_decrypt_slice(data: &mut [u8], cipher: &Aes256, iv: &[u8]) {
+fn ige256_decrypt_slice(data: &mut [u8], cipher: &Wiped<Aes256>, iv: &[u8]) {
     cipher.decrypt_with_backend(IgeDecrypt { data, iv });
 }
 
@@ -201,7 +253,7 @@ impl BlockCipherEncClosure for CtrProcess<'_> {
     }
 }
 
-fn ctr_process<C: BlockCipherEncrypt<BlockSize = U16>>(data: &mut [u8], cipher: &C, ctr: &mut [u8; 16], state: &mut usize) {
+fn ctr_process<C: BlockCipherEncrypt<BlockSize = U16>>(data: &mut [u8], cipher: &Wiped<C>, ctr: &mut [u8; 16], state: &mut usize) {
     cipher.encrypt_with_backend(CtrProcess { data, ctr, state });
 }
 
@@ -242,7 +294,7 @@ fn pack_seal(out: &mut [u8], auth_key: &[u8; 256], auth_key_id: &[u8; 8]) {
     let msg_key: [u8; 16] = msg_key_large[8..24].try_into().unwrap();
 
     let (aes_key, aes_iv) = kdf_inner(auth_key, &msg_key, 0);
-    let cipher = Aes256::new_from_slice(&aes_key).unwrap();
+    let cipher = Wiped::<Aes256>::new(&aes_key);
     ige256_encrypt_slice(&mut out[24..], &cipher, &aes_iv);
 
     out[..8].copy_from_slice(auth_key_id);
@@ -265,7 +317,7 @@ fn unpack_header(packed: &[u8], auth_key_id: &[u8]) -> Result<[u8; 16], Error> {
 fn unpack_open(dec: &mut [u8], msg_key: &[u8; 16], auth_key: &[u8; 256], session_id: &[u8], incoming: bool) -> Result<(i64, i32, usize), Error> {
     let x: usize = if incoming { 8 } else { 0 };
     let (aes_key, aes_iv) = kdf_inner(auth_key, msg_key, x);
-    let cipher = Aes256::new_from_slice(&aes_key).unwrap();
+    let cipher = Wiped::<Aes256>::new(&aes_key);
     ige256_decrypt_slice(dec, &cipher, &aes_iv);
 
     if dec.len() < 32 {
@@ -357,7 +409,7 @@ pub fn ige256_encrypt(data: &mut [u8], key: &[u8; 32], iv: &[u8; 32]) -> Result<
     if data.len() % 16 != 0 {
         return Err(Error::NotBlockAligned);
     }
-    ige256_encrypt_slice(data, &Aes256::new_from_slice(key).unwrap(), iv);
+    ige256_encrypt_slice(data, &Wiped::new(key), iv);
     Ok(())
 }
 
@@ -366,7 +418,7 @@ pub fn ige256_decrypt(data: &mut [u8], key: &[u8; 32], iv: &[u8; 32]) -> Result<
     if data.len() % 16 != 0 {
         return Err(Error::NotBlockAligned);
     }
-    ige256_decrypt_slice(data, &Aes256::new_from_slice(key).unwrap(), iv);
+    ige256_decrypt_slice(data, &Wiped::new(key), iv);
     Ok(())
 }
 
@@ -377,7 +429,7 @@ pub fn ige256_decrypt(data: &mut [u8], key: &[u8; 32], iv: &[u8; 32]) -> Result<
 /// a value of 16 or more is treated as 0.
 pub fn ctr256(data: &mut [u8], key: &[u8; 32], iv: &mut [u8; 16], state: &mut u8) {
     let mut off = if *state < 16 { *state as usize } else { 0 };
-    ctr_process(data, &Aes256::new_from_slice(key).unwrap(), iv, &mut off);
+    ctr_process(data, &Wiped::<Aes256>::new(key), iv, &mut off);
     *state = off as u8;
 }
 
@@ -401,7 +453,7 @@ pub fn ctr256(data: &mut [u8], key: &[u8; 32], iv: &mut [u8; 16], state: &mut u8
 /// assert_eq!((ctr.iv(), ctr.state()), (&iv, state));
 /// ```
 pub struct Ctr256 {
-    cipher: Aes256Enc,
+    cipher: Wiped<Aes256Enc>,
     iv: [u8; 16],
     state: usize,
 }
@@ -409,7 +461,7 @@ pub struct Ctr256 {
 impl Ctr256 {
     /// Starts a stream at counter `iv`.
     pub fn new(key: &[u8; 32], iv: &[u8; 16]) -> Self {
-        Self { cipher: Aes256Enc::new(key.into()), iv: *iv, state: 0 }
+        Self { cipher: Wiped::new(key), iv: *iv, state: 0 }
     }
 
     /// Encrypts or decrypts `data` in place, continuing where the previous call stopped.
