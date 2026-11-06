@@ -152,11 +152,13 @@ fn ctr_matches_reference_across_batch_widths() {
         ]
     };
     let key = range::<32>(11);
-    // the last two carry into the high 64 bits and wrap around, inside a batch
+    // the others carry into the high 64 bits or wrap around inside a batch (the last one also
+    // inside the 4-block batches of the software backend Miri uses)
     let starts = [
         range::<16>(3),
         ((1u128 << 64) - 7).to_be_bytes(),
         (u128::MAX - 19).to_be_bytes(),
+        (u128::MAX - 2).to_be_bytes(),
     ];
     for &len in lens {
         for start in starts {

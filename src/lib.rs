@@ -248,8 +248,8 @@ impl BlockCipherEncClosure for CtrProcess<'_> {
         let mut c = u128::from_be_bytes(*ctr);
 
         let mut wide = data[pos..].chunks_exact_mut(B::ParBlocksSize::USIZE * 16);
-        let mut par: ParBlocks<B> = Default::default();
         for group in &mut wide {
+            let mut par: ParBlocks<B> = Default::default();
             for k in par.iter_mut() {
                 *k = AesBlock::from(c.to_be_bytes());
                 c = c.wrapping_add(1);
