@@ -122,6 +122,74 @@ fn ctr_type_resumes_function_mid_block() {
     }
 }
 
+/// CTR straight from the definition, one block at a time, to check the batched code against.
+fn ctr_reference(key: &[u8; 32], iv: &mut [u8; 16], state: &mut u8, data: &mut [u8]) {
+    use aes::cipher::{BlockCipherEncrypt, KeyInit};
+    let cipher = aes::Aes256Enc::new_from_slice(key).unwrap();
+    let (mut c, mut at) = (u128::from_be_bytes(*iv), *state as usize);
+    for byte in data {
+        let mut ks = aes::Block::from(c.to_be_bytes());
+        cipher.encrypt_block(&mut ks);
+        *byte ^= ks[at];
+        at += 1;
+        if at == 16 {
+            (c, at) = (c.wrapping_add(1), 0);
+        }
+    }
+    (*iv, *state) = (c.to_be_bytes(), at as u8);
+}
+
+#[test]
+fn ctr_matches_reference_across_batch_widths() {
+    // Around the 8-, 30- and 64-block batches of aes's backends (128, 480 and 1024 bytes), so
+    // the batched loop, the block loop and the partial tail all run, with and without each other.
+    let lens: &[usize] = if cfg!(miri) {
+        &[0, 1, 17, 64, 79, 130]
+    } else {
+        &[
+            0, 1, 15, 16, 17, 127, 128, 129, 143, 479, 480, 481, 495, 959, 960, 1023, 1024, 1025,
+            1040, 1503, 2048, 2049, 3071, 4111,
+        ]
+    };
+    let key = range::<32>(11);
+    // the others carry into the high 64 bits or wrap around inside a batch (the last one also
+    // inside the 4-block batches of the software backend Miri uses)
+    let starts = [
+        range::<16>(3),
+        ((1u128 << 64) - 7).to_be_bytes(),
+        (u128::MAX - 19).to_be_bytes(),
+        (u128::MAX - 2).to_be_bytes(),
+    ];
+    for &len in lens {
+        for start in starts {
+            for state in [0, 1, 15] {
+                // `off` moves the data off 16-byte alignment
+                for off in [0, 3] {
+                    let mut want: Vec<u8> = (0..off + len).map(|i| (i * 13 + 5) as u8).collect();
+                    let (mut got_fn, mut got_type) = (want.clone(), want.clone());
+                    let (mut want_iv, mut want_state) = (start, state);
+                    ctr_reference(&key, &mut want_iv, &mut want_state, &mut want[off..]);
+
+                    let (mut iv, mut st) = (start, state);
+                    warpcrypto::ctr256(&mut got_fn[off..], &key, &mut iv, &mut st);
+                    let case = format!("len {len} start {start:02x?} state {state} off {off}");
+                    assert_eq!(got_fn, want, "ctr256, {case}");
+                    assert_eq!((iv, st), (want_iv, want_state), "ctr256, {case}");
+
+                    let mut ctr = warpcrypto::Ctr256::with_state(&key, &start, state);
+                    ctr.apply_keystream(&mut got_type[off..]);
+                    assert_eq!(got_type, want, "Ctr256, {case}");
+                    assert_eq!(
+                        (ctr.iv(), ctr.state()),
+                        (&want_iv, want_state),
+                        "Ctr256, {case}"
+                    );
+                }
+            }
+        }
+    }
+}
+
 #[test]
 fn kdf_known_answer() {
     let (ak, mk) = (auth_key(), range::<16>(0));
