@@ -240,36 +240,41 @@ impl BlockCipherEncClosure for CtrProcess<'_> {
             if pos == len { return; }
         }
 
-        let wide_n = B::ParBlocksSize::USIZE;
-        let mut wide = data[pos..].chunks_exact_mut(wide_n * 16);
+        // The counter stays in a local until the end. Storing it to `ctr` after every block and
+        // loading it again for the next made each block wait for that store to land. LLVM keeps
+        // it in registers when it fully unrolls the 8-block batches of the AES-NI backend, but
+        // not for the 64-block batches of the AVX-512 VAES backend that aes 0.9.4 picks at
+        // runtime, where it cost about 60% of the speed.
+        let mut c = u128::from_be_bytes(*ctr);
+
+        let mut wide = data[pos..].chunks_exact_mut(B::ParBlocksSize::USIZE * 16);
+        let mut par: ParBlocks<B> = Default::default();
         for group in &mut wide {
-            let mut ks: ParBlocks<B> = Default::default();
-            for k in ks.iter_mut() {
-                *k = block_from_slice(ctr);
-                ctr_next(ctr);
+            for k in par.iter_mut() {
+                *k = AesBlock::from(c.to_be_bytes());
+                c = c.wrapping_add(1);
             }
-            backend.encrypt_par_blocks_inplace(&mut ks);
-            for (i, k) in ks.iter().enumerate() {
-                let at = i * 16;
-                let x = u128::from_ne_bytes(group[at..at + 16].try_into().unwrap())
+            backend.encrypt_par_blocks_inplace(&mut par);
+            for (chunk, k) in group.chunks_exact_mut(16).zip(par.iter()) {
+                let x = u128::from_ne_bytes(chunk.try_into().unwrap())
                     ^ u128::from_ne_bytes((*k).into());
-                group[at..at + 16].copy_from_slice(&x.to_ne_bytes());
+                chunk.copy_from_slice(&x.to_ne_bytes());
             }
         }
 
         let mut chunks = wide.into_remainder().chunks_exact_mut(16);
         for chunk in &mut chunks {
-            let mut ks = block_from_slice(ctr);
-            backend.encrypt_block_inplace(&mut ks);
-            let x = u128::from_ne_bytes(chunk.try_into().unwrap())
-                ^ u128::from_ne_bytes(ks.into());
+            let mut k = AesBlock::from(c.to_be_bytes());
+            backend.encrypt_block_inplace(&mut k);
+            let x = u128::from_ne_bytes(chunk.try_into().unwrap()) ^ u128::from_ne_bytes(k.into());
             chunk.copy_from_slice(&x.to_ne_bytes());
-            ctr_next(ctr);
+            c = c.wrapping_add(1);
         }
+        *ctr = c.to_be_bytes();
         let tail = chunks.into_remainder();
 
         if !tail.is_empty() {
-            *ks = block_from_slice(ctr);
+            *ks = AesBlock::from(*ctr);
             backend.encrypt_block_inplace(ks);
             for i in 0..tail.len() {
                 tail[i] ^= ks[i];
