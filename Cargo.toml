@@ -1,6 +1,6 @@
 [package]
 name = "warpcrypto"
-version = "2.1.0"
+version = "2.2.0"
 edition = "2024"
 rust-version = "1.85"
 description = "Fast AES-256-IGE, AES-256-CTR and MTProto 2.0 message packing for Telegram clients"

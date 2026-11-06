@@ -4,7 +4,7 @@ build-backend = "maturin"
 
 [project]
 name = "WarpCrypto"
-version = "2.1.0"
+version = "2.2.0"
 description = "Fast and Portable Cryptography Extension Library (Rust)"
 readme = "README.md"
 requires-python = ">=3.8"
