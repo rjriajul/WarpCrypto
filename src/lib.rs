@@ -2,7 +2,7 @@
 //!
 //! The same code also builds the `warpcrypto` Python extension (behind the `python` feature).
 
-use aes::{Aes256, Aes256Enc};
+use aes::{Aes256Dec, Aes256Enc};
 use aes::cipher::typenum::U16;
 use aes::cipher::typenum::Unsigned;
 use aes::cipher::{
@@ -16,24 +16,42 @@ use std::sync::atomic::{Ordering, compiler_fence};
 
 type AesBlock = Array<u8, U16>;
 
+/// Ciphers a [`Wiped`] may hold: plain bytes with no heap memory or handles.
+trait PlainKeySchedule: KeyInit {}
+impl PlainKeySchedule for Aes256Enc {}
+impl PlainKeySchedule for Aes256Dec {}
+
 /// A cipher whose key schedule is overwritten with zeros when it is dropped.
 ///
 /// This crate doesn't turn on `aes`'s `zeroize` feature: from 0.9 that feature wipes the whole
-/// cipher (about 1 KB, sized for the software fallback) one byte at a time on every drop, which
-/// costs more than encrypting a short message. This wipes the same bytes a machine word at a time.
+/// cipher one byte at a time on every drop, which costs more than encrypting a short message.
+/// This wipes the same bytes a machine word at a time.
 ///
-/// Only for `Aes256` and `Aes256Enc`: plain bytes that own no heap memory or handles, so nothing
-/// is lost when their destructor is skipped.
-struct Wiped<C>(ManuallyDrop<C>);
+/// Best effort: copies Rust leaves when a value is moved aren't wiped. Don't move a `Wiped`;
+/// use [`Wiped::boxed`] for one on the heap.
+#[repr(transparent)]
+struct Wiped<C: PlainKeySchedule>(ManuallyDrop<C>);
 
-impl<C: KeyInit> Wiped<C> {
+impl<C: PlainKeySchedule> Wiped<C> {
     /// Panics unless `key` has the cipher's key length.
     fn new(key: &[u8]) -> Self {
         Self(ManuallyDrop::new(C::new_from_slice(key).unwrap()))
     }
+
+    /// Like [`Wiped::new`], on the heap, with the stack copy wiped.
+    fn boxed(key: &[u8]) -> Box<Self> {
+        let tmp = Self::new(key);
+        let mut b = Box::<Self>::new_uninit();
+        // SAFETY: `C` is plain bytes, so a byte copy is a valid `Self` and both copies can be
+        // dropped; dropping `tmp` wipes the stack copy.
+        unsafe {
+            b.as_mut_ptr().copy_from_nonoverlapping(&tmp, 1);
+            b.assume_init()
+        }
+    }
 }
 
-impl<C> Deref for Wiped<C> {
+impl<C: PlainKeySchedule> Deref for Wiped<C> {
     type Target = C;
 
     fn deref(&self) -> &C {
@@ -41,7 +59,7 @@ impl<C> Deref for Wiped<C> {
     }
 }
 
-impl<C> Drop for Wiped<C> {
+impl<C: PlainKeySchedule> Drop for Wiped<C> {
     fn drop(&mut self) {
         const { assert!(align_of::<C>() >= align_of::<usize>()) };
         let words = size_of::<C>() / size_of::<usize>();
@@ -51,9 +69,9 @@ impl<C> Drop for Wiped<C> {
         // (asserted above); `words` words and then `tail` bytes cover exactly those bytes.
         // `self.0` is never read or dropped after this, so the zeros need not be a valid `C`.
         // Not running `C`'s destructor is allowed in safe Rust (as with `mem::forget`), so it
-        // can't make this unsound. It also loses nothing: `Aes256`/`Aes256Enc` hold only `Copy`
-        // unions of plain bytes, with no heap memory or handles, and their `Drop` only wipes, and
-        // only when some crate in the build turns on `aes`'s `zeroize` feature.
+        // can't make this unsound, and `PlainKeySchedule` limits `C` to types where it loses
+        // nothing: their `Drop` only wipes, and only when some crate in the build turns on
+        // `aes`'s `zeroize` feature.
         unsafe {
             for i in 0..words {
                 p.add(i).write_volatile(0);
@@ -131,11 +149,11 @@ impl BlockCipherDecClosure for IgeDecrypt<'_> {
     }
 }
 
-fn ige256_encrypt_slice(data: &mut [u8], cipher: &Wiped<Aes256>, iv: &[u8]) {
+fn ige256_encrypt_slice(data: &mut [u8], cipher: &Wiped<Aes256Enc>, iv: &[u8]) {
     cipher.encrypt_with_backend(IgeEncrypt { data, iv });
 }
 
-fn ige256_decrypt_slice(data: &mut [u8], cipher: &Wiped<Aes256>, iv: &[u8]) {
+fn ige256_decrypt_slice(data: &mut [u8], cipher: &Wiped<Aes256Dec>, iv: &[u8]) {
     cipher.decrypt_with_backend(IgeDecrypt { data, iv });
 }
 
@@ -183,6 +201,9 @@ struct CtrProcess<'a> {
     data: &'a mut [u8],
     ctr: &'a mut [u8; 16],
     state: &'a mut usize,
+    /// Keystream for `ctr` while `state != 0`; trusted on entry only if `ks_ready`.
+    ks: &'a mut AesBlock,
+    ks_ready: bool,
 }
 
 impl BlockSizeUser for CtrProcess<'_> {
@@ -194,6 +215,7 @@ impl BlockCipherEncClosure for CtrProcess<'_> {
         let data = self.data;
         let ctr = self.ctr;
         let state = self.state;
+        let ks = self.ks;
 
         let len = data.len();
         if len == 0 { return; }
@@ -201,8 +223,10 @@ impl BlockCipherEncClosure for CtrProcess<'_> {
         let mut pos = 0;
 
         if *state != 0 {
-            let mut ks = block_from_slice(ctr);
-            backend.encrypt_block_inplace(&mut ks);
+            if !self.ks_ready {
+                *ks = block_from_slice(ctr);
+                backend.encrypt_block_inplace(ks);
+            }
             let take = (16 - *state).min(len);
             for i in 0..take {
                 data[pos + i] ^= ks[*state + i];
@@ -245,8 +269,8 @@ impl BlockCipherEncClosure for CtrProcess<'_> {
         let tail = chunks.into_remainder();
 
         if !tail.is_empty() {
-            let mut ks = block_from_slice(ctr);
-            backend.encrypt_block_inplace(&mut ks);
+            *ks = block_from_slice(ctr);
+            backend.encrypt_block_inplace(ks);
             for i in 0..tail.len() {
                 tail[i] ^= ks[i];
             }
@@ -255,8 +279,9 @@ impl BlockCipherEncClosure for CtrProcess<'_> {
     }
 }
 
-fn ctr_process<C: BlockCipherEncrypt<BlockSize = U16>>(data: &mut [u8], cipher: &Wiped<C>, ctr: &mut [u8; 16], state: &mut usize) {
-    cipher.encrypt_with_backend(CtrProcess { data, ctr, state });
+fn ctr_process(data: &mut [u8], cipher: &Wiped<Aes256Enc>, ctr: &mut [u8; 16], state: &mut usize) {
+    let mut ks = AesBlock::default();
+    cipher.encrypt_with_backend(CtrProcess { data, ctr, state, ks: &mut ks, ks_ready: false });
 }
 
 fn packed_len(body_len: usize) -> usize {
@@ -296,7 +321,7 @@ fn pack_seal(out: &mut [u8], auth_key: &[u8; 256], auth_key_id: &[u8; 8]) {
     let msg_key: [u8; 16] = msg_key_large[8..24].try_into().unwrap();
 
     let (aes_key, aes_iv) = kdf_inner(auth_key, &msg_key, 0);
-    let cipher = Wiped::<Aes256>::new(&aes_key);
+    let cipher = Wiped::<Aes256Enc>::new(&aes_key);
     ige256_encrypt_slice(&mut out[24..], &cipher, &aes_iv);
 
     out[..8].copy_from_slice(auth_key_id);
@@ -319,7 +344,7 @@ fn unpack_header(packed: &[u8], auth_key_id: &[u8]) -> Result<[u8; 16], Error> {
 fn unpack_open(dec: &mut [u8], msg_key: &[u8; 16], auth_key: &[u8; 256], session_id: &[u8], incoming: bool) -> Result<(i64, i32, usize), Error> {
     let x: usize = if incoming { 8 } else { 0 };
     let (aes_key, aes_iv) = kdf_inner(auth_key, msg_key, x);
-    let cipher = Wiped::<Aes256>::new(&aes_key);
+    let cipher = Wiped::<Aes256Dec>::new(&aes_key);
     ige256_decrypt_slice(dec, &cipher, &aes_iv);
 
     if dec.len() < 32 {
@@ -431,7 +456,7 @@ pub fn ige256_decrypt(data: &mut [u8], key: &[u8; 32], iv: &[u8; 32]) -> Result<
 /// a value of 16 or more is treated as 0.
 pub fn ctr256(data: &mut [u8], key: &[u8; 32], iv: &mut [u8; 16], state: &mut u8) {
     let mut off = if *state < 16 { *state as usize } else { 0 };
-    ctr_process(data, &Wiped::<Aes256>::new(key), iv, &mut off);
+    ctr_process(data, &Wiped::new(key), iv, &mut off);
     *state = off as u8;
 }
 
@@ -455,20 +480,37 @@ pub fn ctr256(data: &mut [u8], key: &[u8; 32], iv: &mut [u8; 16], state: &mut u8
 /// assert_eq!((ctr.iv(), ctr.state()), (&iv, state));
 /// ```
 pub struct Ctr256 {
-    cipher: Wiped<Aes256Enc>,
+    cipher: Box<Wiped<Aes256Enc>>,
     iv: [u8; 16],
     state: usize,
+    ks: AesBlock,
 }
 
 impl Ctr256 {
     /// Starts a stream at counter `iv`.
     pub fn new(key: &[u8; 32], iv: &[u8; 16]) -> Self {
-        Self { cipher: Wiped::new(key), iv: *iv, state: 0 }
+        Self::with_state(key, iv, 0)
+    }
+
+    /// Continues a stream that [`ctr256`] left at counter `iv` and `state`.
+    /// A `state` of 16 or more is treated as 0, as in [`ctr256`].
+    pub fn with_state(key: &[u8; 32], iv: &[u8; 16], state: u8) -> Self {
+        let cipher = Wiped::<Aes256Enc>::boxed(key);
+        let mut ks = AesBlock::from(*iv);
+        cipher.encrypt_block(&mut ks);
+        let state = if state < 16 { state as usize } else { 0 };
+        Self { cipher, iv: *iv, state, ks }
     }
 
     /// Encrypts or decrypts `data` in place, continuing where the previous call stopped.
     pub fn apply_keystream(&mut self, data: &mut [u8]) {
-        ctr_process(data, &self.cipher, &mut self.iv, &mut self.state);
+        self.cipher.encrypt_with_backend(CtrProcess {
+            data,
+            ctr: &mut self.iv,
+            state: &mut self.state,
+            ks: &mut self.ks,
+            ks_ready: true,
+        });
     }
 
     /// The current counter, as [`ctr256`] would have left `iv`.
@@ -485,6 +527,14 @@ impl Ctr256 {
 impl std::fmt::Debug for Ctr256 {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Ctr256").finish_non_exhaustive()
+    }
+}
+
+impl Drop for Ctr256 {
+    fn drop(&mut self) {
+        // SAFETY: `self.ks` is a valid, aligned place we own.
+        unsafe { std::ptr::write_volatile(&mut self.ks, AesBlock::default()) };
+        compiler_fence(Ordering::SeqCst);
     }
 }
 

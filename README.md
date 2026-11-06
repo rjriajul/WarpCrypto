@@ -25,7 +25,9 @@ warpcrypto::ige256_encrypt(&mut data, &key, &iv)?;        // data.len() must be 
 warpcrypto::ctr256(&mut data, &key, &mut iv, &mut state); // encrypt and decrypt are the same
 
 let mut stream = warpcrypto::Ctr256::new(&key, &iv);       // same as ctr256, key expanded once
-stream.apply_keystream(&mut chunk);
+stream.apply_keystream(&mut data[..100]);
+stream.apply_keystream(&mut data[100..]);
+
 let (aes_key, aes_iv) = warpcrypto::kdf(&auth_key, &msg_key, true);
 ```
 
@@ -38,7 +40,7 @@ AES uses the CPU's AES instructions when they are there (AES-NI on x86, the ARMv
 - **Zero-copy** IGE with block-aligned operations
 - **Block-based CTR** — processes 16-byte blocks with `chunks_exact_mut`, not byte-by-byte
 - **Proper state propagation** — IV and state bytearrays are mutated in-place matching tgcrypto exactly
-- **Memory safe** — Rust's type system guarantees no buffer overflows, use-after-free, or data races
+- **Memory safe** — safe Rust except two small `unsafe` blocks that zero AES key schedules, checked with Miri in CI
 - **Zero compiler warnings**
 
 ## Requirements

@@ -106,6 +106,23 @@ fn ctr_type_matches_function_across_calls() {
 }
 
 #[test]
+fn ctr_type_resumes_function_mid_block() {
+    let (key, start) = (range::<32>(9), range::<16>(4));
+    for split in [0, 1, 15, 16, 37, 64] {
+        let plain = range::<100>(1);
+        let (mut a, mut b) = (plain, plain);
+        let (mut iv, mut state) = (start, 0);
+        warpcrypto::ctr256(&mut a[..split], &key, &mut iv, &mut state);
+        let mut ctr = warpcrypto::Ctr256::with_state(&key, &iv, state);
+        ctr.apply_keystream(&mut a[split..]);
+        let (mut iv, mut state) = (start, 0);
+        warpcrypto::ctr256(&mut b, &key, &mut iv, &mut state);
+        assert_eq!(a, b, "split {split}");
+        assert_eq!((ctr.iv(), ctr.state()), (&iv, state), "split {split}");
+    }
+}
+
+#[test]
 fn kdf_known_answer() {
     let (ak, mk) = (auth_key(), range::<16>(0));
     let (k, iv) = warpcrypto::kdf(&ak, &mk, true);
