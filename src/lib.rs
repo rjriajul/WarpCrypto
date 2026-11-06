@@ -18,9 +18,12 @@ type AesBlock = Array<u8, U16>;
 
 /// A cipher whose key schedule is overwritten with zeros when it is dropped.
 ///
-/// `aes` is built without its `zeroize` feature: from 0.9 that feature wipes the whole cipher
-/// (about 1 KB, sized for the software fallback) one byte at a time on every drop, which costs
-/// more than encrypting a short message. This wipes the same bytes a machine word at a time.
+/// This crate doesn't turn on `aes`'s `zeroize` feature: from 0.9 that feature wipes the whole
+/// cipher (about 1 KB, sized for the software fallback) one byte at a time on every drop, which
+/// costs more than encrypting a short message. This wipes the same bytes a machine word at a time.
+///
+/// Only for `Aes256` and `Aes256Enc`: plain bytes that own no heap memory or handles, so nothing
+/// is lost when their destructor is skipped.
 struct Wiped<C>(ManuallyDrop<C>);
 
 impl<C: KeyInit> Wiped<C> {
@@ -47,11 +50,10 @@ impl<C> Drop for Wiped<C> {
         // SAFETY: `p` points to the `size_of::<C>()` bytes of `self.0` and is aligned for `usize`
         // (asserted above); `words` words and then `tail` bytes cover exactly those bytes.
         // `self.0` is never read or dropped after this, so the zeros need not be a valid `C`.
-        // Skipping `C`'s destructor is fine because it does nothing here: in aes 0.9.2 the `Drop`
-        // of `Aes256`/`Aes256Enc` (src/lib.rs:434-442) has the `zeroize` wipe as its only
-        // statement, compiled out since that feature is off, and the ciphers own no heap memory.
-        // `needs_drop::<C>()` is still true because the impl exists, so this can't be asserted;
-        // it relies on that body staying empty, which the `<0.9.3` cap in Cargo.toml pins.
+        // Not running `C`'s destructor is allowed in safe Rust (as with `mem::forget`), so it
+        // can't make this unsound. It also loses nothing: `Aes256`/`Aes256Enc` hold only `Copy`
+        // unions of plain bytes, with no heap memory or handles, and their `Drop` only wipes, and
+        // only when some crate in the build turns on `aes`'s `zeroize` feature.
         unsafe {
             for i in 0..words {
                 p.add(i).write_volatile(0);

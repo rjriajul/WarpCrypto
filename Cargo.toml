@@ -24,7 +24,12 @@ sha2 = "0.10"
 getrandom = "0.2"
 
 [dependencies.aes]
-# 0.9.3 raised the aes MSRV to 1.89; keep this cap until rust-version moves past it
+# Capped below 0.9.3 for two reasons:
+# - 0.9.3 raised the aes MSRV to 1.89, above our rust-version;
+# - on x86 CPUs with VAES, 0.9.4 picks a 30-block backend at runtime and our CTR loop gets
+#   about 2.6x slower (ctr256 at 512 KiB: ~2290 vs ~5920 MB/s, bench run 42071050073).
+# Cargo allows one aes 0.9.x per build, so a project that also needs aes >= 0.9.3 can't
+# build with this crate until the cap is lifted.
 version = ">=0.9.2, <0.9.3"
 # no `zeroize` feature: it wipes the cipher a byte at a time on every drop; `Wiped` in lib.rs
 # wipes the same bytes a word at a time
