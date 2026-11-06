@@ -23,19 +23,24 @@ let msg = warpcrypto::unpack_message(&reply, &auth_key, &auth_key_id, &session_i
 
 warpcrypto::ige256_encrypt(&mut data, &key, &iv)?;        // data.len() must be a multiple of 16
 warpcrypto::ctr256(&mut data, &key, &mut iv, &mut state); // encrypt and decrypt are the same
+
+let mut stream = warpcrypto::Ctr256::new(&key, &iv);       // same as ctr256, key expanded once
+stream.apply_keystream(&mut data[..100]);
+stream.apply_keystream(&mut data[100..]);
+
 let (aes_key, aes_iv) = warpcrypto::kdf(&auth_key, &msg_key, true);
 ```
 
-On ARM (Apple Silicon, ARM servers), build with `RUSTFLAGS="--cfg aes_armv8"` to use the CPU's AES instructions; without it AES runs in software. The Python wheels already do this.
+AES uses the CPU's AES instructions when they are there (AES-NI on x86, the ARMv8 Cryptography Extensions on ARM), picked at runtime; no build flags needed.
 
 ## Features
 
 - **3–5× faster** than tgcrypto (C extension) in multi-client benchmarks
-- **AES-NI hardware acceleration** via the `aes` crate's runtime CPU feature detection (`cpufeatures`)
-- **Zero-copy** IGE with block-aligned GenericArray operations
+- **Hardware AES** (AES-NI on x86, ARMv8 AES on ARM) via the `aes` crate's runtime CPU feature detection (`cpufeatures`)
+- **Zero-copy** IGE with block-aligned operations
 - **Block-based CTR** — processes 16-byte blocks with `chunks_exact_mut`, not byte-by-byte
 - **Proper state propagation** — IV and state bytearrays are mutated in-place matching tgcrypto exactly
-- **Memory safe** — Rust's type system guarantees no buffer overflows, use-after-free, or data races
+- **Memory safe** — safe Rust except two small `unsafe` blocks that zero AES key schedules, checked with Miri in CI
 - **Zero compiler warnings**
 
 ## Requirements

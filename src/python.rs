@@ -1,10 +1,8 @@
-use aes::Aes256;
-use aes::cipher::KeyInit;
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use pyo3::types::{PyByteArray, PyBytes};
 
-use crate::{ctr_process, ige256_decrypt_slice, ige256_encrypt_slice, kdf_inner};
+use crate::{ctr_process, ige256_decrypt_slice, ige256_encrypt_slice, kdf_inner, Wiped};
 use crate::{pack_plain, pack_seal, packed_len, unpack_header, unpack_open, Error};
 
 thread_local! {
@@ -41,7 +39,7 @@ fn ige256_encrypt<'py>(py: Python<'py>, data: &[u8], key: &[u8], iv: &[u8]) -> P
     let key: [u8; 32] = key.try_into().unwrap();
     let iv: [u8; 32] = iv.try_into().unwrap();
     let buf = maybe_detach(py, buf.len(), move || {
-        let cipher = Aes256::new_from_slice(&key).unwrap();
+        let cipher = Wiped::new(&key);
         let mut buf = buf;
         ige256_encrypt_slice(&mut buf, &cipher, &iv);
         buf
@@ -61,7 +59,7 @@ fn ige256_decrypt<'py>(py: Python<'py>, data: &[u8], key: &[u8], iv: &[u8]) -> P
     let key: [u8; 32] = key.try_into().unwrap();
     let iv: [u8; 32] = iv.try_into().unwrap();
     let buf = maybe_detach(py, buf.len(), move || {
-        let cipher = Aes256::new_from_slice(&key).unwrap();
+        let cipher = Wiped::new(&key);
         let mut buf = buf;
         ige256_decrypt_slice(&mut buf, &cipher, &iv);
         buf
@@ -94,7 +92,7 @@ fn ctr256_encrypt<'py>(
     if state_off >= 16 { state_off = 0; }
 
     let (buf, ctr_out, state_out) = maybe_detach(py, data.len(), move || {
-        let cipher = Aes256::new_from_slice(&key).unwrap();
+        let cipher = Wiped::new(&key);
         let mut buf = data;
         ctr_process(&mut buf, &cipher, &mut ctr, &mut state_off);
         (buf, ctr, state_off)
@@ -141,7 +139,7 @@ fn ctr256_encrypt_inplace(
     if state_off >= 16 { state_off = 0; }
 
     let (buf, ctr_out, state_out) = maybe_detach(py, buf.len(), move || {
-        let cipher = Aes256::new_from_slice(&key).unwrap();
+        let cipher = Wiped::new(&key);
         ctr_process(&mut buf, &cipher, &mut ctr, &mut state_off);
         (buf, ctr, state_off)
     });
@@ -221,7 +219,7 @@ fn ctr256_encrypt_batch(
     }
 
     let results = _py.detach(move || {
-        let cipher = Aes256::new_from_slice(&key_vec).unwrap();
+        let cipher = Wiped::new(&key_vec);
         for i in 0..n {
             let slice = &mut data_owned[offsets[i]..offsets[i + 1]];
             ctr_process(slice, &cipher, &mut ctrs[i], &mut state_offs[i]);
